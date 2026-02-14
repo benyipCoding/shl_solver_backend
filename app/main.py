@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from app.core.lifespan import lifespan
-from app.router import auth
+from app.router import auth, captcha
 
-app = FastAPI()
 
 app = FastAPI(
     title="SHL Solver API",
@@ -10,4 +9,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(auth.router)
+# 创建一个总的 API 路由，并设置前缀
+api_router = APIRouter()
+api_router.include_router(auth.router)
+api_router.include_router(captcha.router)
+
+# 将总路由挂载到 app，配置公共前缀 /api
+app.include_router(api_router, prefix="/api")

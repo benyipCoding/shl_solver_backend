@@ -9,6 +9,8 @@ from app.services.auth import auth_service
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
+ACCESS_TOKEN_KEY = "access_token"
+
 
 @router.post("/register", response_model=APIResponse[UserSerializer])
 async def register(
@@ -25,7 +27,7 @@ async def register(
     )
     token = auth_service.create_access_token({"sub": str(user.id), "email": user.email})
     response.set_cookie(
-        key="access_token",
+        key=ACCESS_TOKEN_KEY,
         value=token,
         httponly=True,
         secure=False,
@@ -43,7 +45,7 @@ async def login(
         return APIResponse(code=401, message="Invalid credentials")
     token = auth_service.create_access_token({"sub": str(user.id), "email": user.email})
     response.set_cookie(
-        key="access_token",
+        key=ACCESS_TOKEN_KEY,
         value=token,
         httponly=True,
         secure=False,
