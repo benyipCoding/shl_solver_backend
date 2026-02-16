@@ -39,7 +39,7 @@ class CaptchaService:
         stored_code = await r.get(key)
         if stored_code is None:
             return False
-        if stored_code.decode("utf-8").lower() != user_input.lower():
+        if stored_code.lower() != user_input.lower():
             return False
 
         # 校验成功后删除（防止重复使用）
