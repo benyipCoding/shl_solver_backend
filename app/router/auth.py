@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.clients.db import get_db
 from app.schemas.response import APIResponse
 from app.schemas.auth import AuthRequest, UserSerializer
 from app.services.auth import auth_service
+from app.core.config import settings
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -19,7 +19,7 @@ async def register(
     # Only email & password provided by frontend. Use email local part as username.
     existing = await auth_service.get_by_email(db, payload.email)
     if existing:
-        return APIResponse(code=400, message="Email already registered")
+        return APIResponse(code=409, message="Email already registered")
 
     username = payload.email.split("@")[0]
     user = await auth_service.create_user(
@@ -29,9 +29,9 @@ async def register(
     response.set_cookie(
         key=ACCESS_TOKEN_KEY,
         value=token,
-        httponly=True,
-        secure=False,
-        samesite="lax",
+        httponly=settings.cookie_httponly,
+        secure=settings.cookie_secure,
+        samesite=settings.cookie_samesite,
     )
     return APIResponse(data=user)
 
@@ -47,8 +47,8 @@ async def login(
     response.set_cookie(
         key=ACCESS_TOKEN_KEY,
         value=token,
-        httponly=True,
-        secure=False,
-        samesite="lax",
+        httponly=settings.cookie_httponly,
+        secure=settings.cookie_secure,
+        samesite=settings.cookie_samesite,
     )
     return APIResponse(data=user)

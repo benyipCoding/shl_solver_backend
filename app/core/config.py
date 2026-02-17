@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     jwt_access_token_expires_minutes: int = 60
     cookie_secure: bool = False
     cookie_samesite: str = "lax"
+    cookie_httponly: bool = True
     # Redis settings
     redis_host: str = "localhost"
     redis_port: int = 6379
