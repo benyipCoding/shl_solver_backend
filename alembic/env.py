@@ -8,6 +8,7 @@ from app.models.base import Base
 from app.models.user import (
     User,
 )  # noqa: F401 - ensure User is imported so its metadata is registered
+from app.models.llms import LLMs  # noqa: F401
 from app.core.config import settings
 
 # this is the Alembic Config object, which provides
