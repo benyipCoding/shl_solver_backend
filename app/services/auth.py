@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.user import User
 import redis.asyncio as redis
+from app.schemas.response import APIResponse
+from fastapi import HTTPException, status
 
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -54,9 +56,15 @@ class AuthService:
     ) -> Optional[User]:
         user = await self.get_by_email(db, email)
         if user is None:
-            return None
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="用户不存在",
+            )
         if not self.verify_password(password, user.password):
-            return None
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="密码错误",
+            )
         return user
 
     def create_access_token(self, data: dict) -> str:

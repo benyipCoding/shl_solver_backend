@@ -42,8 +42,6 @@ async def login(
     redis: redis.Redis = Depends(get_redis),
 ):
     user = await auth_service.authenticate_user(db, payload.email, payload.password)
-    if not user:
-        return APIResponse(code=401, message="Invalid credentials")
 
     data = {"sub": str(user.id), "email": user.email}
     access_token = auth_service.create_access_token(data)
@@ -112,13 +110,13 @@ async def refresh_token(
     if not refresh_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token missing",
+            detail="Token失效",
         )
     new_access_token = await auth_service.refresh_access_token(refresh_token, redis)
     if not new_access_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Failed to refresh access token",
+            detail="Token失败",
         )
 
     response.set_cookie(
