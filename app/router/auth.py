@@ -9,6 +9,7 @@ from app.clients.redis_client import get_redis
 import redis.asyncio as redis
 from fastapi import Request
 from app.schemas.user import UserSerializer
+from fastapi import HTTPException, status
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -109,10 +110,16 @@ async def refresh_token(
 ):
     refresh_token = request.cookies.get(REFRESH_TOKEN_KEY)
     if not refresh_token:
-        return APIResponse(code=411, message="Refresh token missing")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token missing",
+        )
     new_access_token = await auth_service.refresh_access_token(refresh_token, redis)
     if not new_access_token:
-        return APIResponse(code=411, message="Failed to refresh access token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Failed to refresh access token",
+        )
 
     response.set_cookie(
         key=ACCESS_TOKEN_KEY,

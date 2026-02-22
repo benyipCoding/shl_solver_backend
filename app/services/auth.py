@@ -98,7 +98,7 @@ class AuthService:
 
             # 验证 refresh token 是否在 Redis 中有效
             stored_user_id = await redis.get(f"refresh_token:{refresh_token}")
-            if stored_user_id is None or stored_user_id.decode("utf-8") != user_id:
+            if stored_user_id is None or stored_user_id != user_id:
                 return None
 
             # 创建新的 access token
