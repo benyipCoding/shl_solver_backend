@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.token_record import TokenRecord
+from fastapi import Request
 
 # from sqlalchemy import select
 
@@ -7,15 +8,22 @@ from app.models.token_record import TokenRecord
 class TokenRecordService:
     async def record_token_usage(
         self,
+        request: Request,
         db: AsyncSession,
-        ip: str,
         token_count: int,
         model: str = None,
-        user_id: int = None,
     ):
         try:
             record = TokenRecord(
-                ip=ip, token_count=token_count, model=model, user_id=user_id
+                ip=getattr(request.state, "real_ip", request.client.host),
+                token_count=token_count,
+                model=model,
+                user_id=(
+                    getattr(request.state, "user", None).id
+                    if getattr(request.state, "user", None)
+                    else None
+                ),
+                request_path=request.url.path,
             )
             db.add(record)
             await db.commit()

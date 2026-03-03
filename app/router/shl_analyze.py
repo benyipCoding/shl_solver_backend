@@ -29,12 +29,9 @@ async def process_shl_analyze(
     payload: SHLAnalyzePayload,
     db: AsyncSession = Depends(get_db),
 ):
-    client_ip = getattr(request.state, "real_ip", request.client.host)
     llm = await llms_service.get_by_id(db, payload.llmId)
     if not llm or not llm.enabled:
         return APIResponse(message="LLM not found or disabled", code=404)
 
-    result = await shl_service.analyze(
-        payload, db, client_ip, llm.key, request.state.user.id
-    )
+    result = await shl_service.analyze(request, payload, db, llm.key)
     return APIResponse(data=result)
