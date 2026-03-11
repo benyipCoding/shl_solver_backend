@@ -4,7 +4,7 @@ import base64
 import json
 import mimetypes
 from app.schemas.shl_analyze import ImageData
-from app.clients.db import async_session
+from app.clients import db  # 修改为导入模块，从而可以使用 db.async_session
 from app.models.shl_solver import SHLSolverHistory
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,7 +63,11 @@ async def save_shl_history_to_db(
     保存 SHL 分析的历史记录到数据库
     """
     try:
-        async with async_session() as session:
+        if db.async_session is None:
+            print("Error: db.async_session is None")
+            return
+
+        async with db.async_session() as session:
             history = SHLSolverHistory(
                 image_urls=",".join(image_paths),
                 token_count=token_count,
