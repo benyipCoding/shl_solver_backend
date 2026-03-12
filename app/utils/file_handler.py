@@ -60,6 +60,7 @@ async def save_shl_history_to_db(
     token_count: int,
     result_data: Union[List, Dict, Any],  # 【修改1】类型提示兼容 List 和 Dict,
     image_paths: list[str],
+    status: str = "completed",
 ):
     """
     保存 SHL 分析的历史记录到数据库
@@ -79,7 +80,7 @@ async def save_shl_history_to_db(
                 model=model,
                 user_id=user_id,
                 result_json=json.dumps(safe_json_data, ensure_ascii=False),
-                status="completed",
+                status=status,
             )
             session.add(history)
             await session.commit()
@@ -93,7 +94,8 @@ async def handle_shl_analyze_background_task(
     user_id: int,
     model: str,
     token_count: int,
-    result_data: dict,
+    result_data: Union[List, Dict, Any],
+    status: str = "completed",
 ):
     """
     处理 SHL 分析后的后台任务：保存图片 + 记录历史
@@ -104,4 +106,6 @@ async def handle_shl_analyze_background_task(
     saved_paths = save_images_to_local(images_data)
 
     # 2. 再异步保存数据库记录
-    await save_shl_history_to_db(user_id, model, token_count, result_data, saved_paths)
+    await save_shl_history_to_db(
+        user_id, model, token_count, result_data, saved_paths, status=status
+    )
