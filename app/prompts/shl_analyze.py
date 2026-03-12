@@ -27,6 +27,14 @@ system_prompt = """You are an expert algorithmist and software engineer speciali
        - The code must be highly optimized, handle edge cases, and include comments explaining the logic.
     5. "complexity": Time and Space complexity analysis (in Chinese). Can be a string or an object with "time" and "space" keys.
     
+    ======================================================================
+    CRITICAL OUTPUT FORMAT OVERRIDE: 
+    Regardless of how many problems are found (even if there is only ONE problem), your entire output MUST be a JSON Array (a list). NEVER return a single JSON object at the root level. 
+    You MUST wrap your object(s) in square brackets `[]`. 
+    Example for one problem: `[{ "summary": "...", "key_concepts": [...], ... }]`
+    Example for multiple problems: `[{...}, {...}]`
+    ======================================================================
+    
     IMPORTANT: Ensure the JSON is valid and strictly follows the structure. Do not wrap the JSON in markdown code blocks like ```json. Just return the raw JSON string."""
 
 user_prompt = "Analyze these images containing a coding problem description. Provide solutions in Python, Java, and JavaScript based on the complete context."
