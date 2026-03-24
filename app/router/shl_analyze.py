@@ -24,7 +24,7 @@ router = APIRouter(
     "",
     response_model=APIResponse[SHLAnalyzeResult],
     dependencies=[
-        Depends(RateLimiter(times=3, seconds=60, identifier=ai_rate_limit_key)),
+        Depends(RateLimiter(times=1, seconds=60, identifier=ai_rate_limit_key)),
     ],
 )
 async def process_shl_analyze(
