@@ -6,6 +6,16 @@ class AuthRequest(BaseModel):
     password: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+    confirm_password: str
+
+
 class CaptchaRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

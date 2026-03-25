@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     smtp_server: str = "smtp.qq.com"
     smtp_port: int = 465
 
+    frontend_base_url: str = "http://localhost:3000"
+
     class Config:
         env_file = ".env"
 

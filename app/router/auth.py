@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Response, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.clients.db import get_db
 from app.schemas.response import APIResponse
-from app.schemas.auth import AuthRequest
+from app.schemas.auth import AuthRequest, ForgotPasswordRequest, ResetPasswordRequest
 from app.services.auth import auth_service
 from app.core.config import settings
 from app.clients.redis_client import get_redis
@@ -10,6 +10,8 @@ import redis.asyncio as redis
 from fastapi import Request
 from app.schemas.user import UserSerializer
 from fastapi import HTTPException, status
+import uuid
+from app.utils.email_helper import send_password_reset_email
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -129,3 +131,73 @@ async def refresh_token(
     )
 
     return APIResponse(message="Access token refreshed")
+
+
+@router.post("/forgot-password", response_model=APIResponse)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    redis: redis.Redis = Depends(get_redis),
+):
+    """
+    发送密码重置邮件
+    """
+    # 查找用户
+    user = await auth_service.get_by_email(db, payload.email)
+
+    # 即使用户不存在，也返回成功，避免邮箱暴力枚举
+    if user:
+        # 生成一次性 Token (UUID)
+        token = str(uuid.uuid4())
+
+        # 将 Token 存入 Redis，有效期 15 分钟 (900秒)
+        # Key: reset_token:{token} -> Value: user_id
+        await redis.set(f"reset_token:{token}", str(user.id), ex=15 * 60)
+
+        # 构建重置链接 (前端路由)
+        reset_link = f"{settings.frontend_base_url}/reset-password?token={token}"
+
+        # 异步发送邮件
+        background_tasks.add_task(send_password_reset_email, user.email, reset_link)
+
+    return APIResponse(message="如果该邮箱已注册，我们已发送重置密码链接，请查收邮件。")
+
+
+@router.post("/reset-password", response_model=APIResponse)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+    redis: redis.Redis = Depends(get_redis),
+):
+    """
+    使用 Token 重置密码
+    """
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="两次输入的密码不一致",
+        )
+
+    # 验证 Token
+    user_id = await redis.get(f"reset_token:{payload.token}")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="重置链接无效或已过期",
+        )
+
+    # 获取用户并更新密码
+    user = await auth_service.get_by_id(db, int(user_id))
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在",
+        )
+
+    await auth_service.update_password(db, user, payload.new_password)
+
+    # 消费掉 Token
+    await redis.delete(f"reset_token:{payload.token}")
+
+    return APIResponse(message="密码重置成功，请使用新密码登录")

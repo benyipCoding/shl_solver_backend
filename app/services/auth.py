@@ -23,6 +23,11 @@ class AuthService:
         result = await db.execute(stmt)
         return result.scalars().first()
 
+    async def get_by_id(self, db: AsyncSession, user_id: int) -> Optional[User]:
+        stmt = select(User).where(User.id == user_id)
+        result = await db.execute(stmt)
+        return result.scalars().first()
+
     async def create_user(
         self, db: AsyncSession, username: str, email: str, password: str
     ) -> User:
@@ -65,6 +70,14 @@ class AuthService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="密码错误",
             )
+        return user
+
+    async def update_password(self, db: AsyncSession, user: User, new_password: str):
+        hashed_input = hashlib.sha256(new_password.encode("utf-8")).hexdigest()
+        hashed = pwd_context.hash(hashed_input)
+        user.password = hashed
+        await db.commit()
+        await db.refresh(user)
         return user
 
     def create_access_token(self, data: dict) -> str:
