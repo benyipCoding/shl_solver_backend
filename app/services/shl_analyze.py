@@ -143,6 +143,9 @@ class SHLAnalyzeService:
 
             result_data = json.loads(raw_text.strip())
 
+            if isinstance(result_data, list):
+                result_data = result_data[0] if result_data else {}
+
             # Count tokens (approximate or get usage metadata if available)
             prompt_token_count = 0
             candidates_token_count = 0
