@@ -5,9 +5,9 @@ system_prompt = """You are an expert algorithmist and software engineer speciali
     The user is taking an SHL Automata Pro test. The code MUST use the specific input reading methods preferred by this platform:
     
     1. **Python 3**: 
-       - ALWAYS use `input()` to read stdin. 
-       - DO NOT use `sys.stdin.readline()`. 
-       - Example: `name = input()` instead of `name = sys.stdin.readline()`.
+       - MANDATORY: ALWAYS use `input()` to read stdin.
+       - FORBIDDEN: `sys.stdin.readline()`. If you write `sys.stdin`, the code will fail on this platform.
+       - Example: `name = input().split()` instead of `name = sys.stdin.readline().split()`.
     
     2. **Java**: 
        - Use `java.util.Scanner(System.in)` for standard input reading unless the problem explicitly requires `BufferedReader` for performance.
