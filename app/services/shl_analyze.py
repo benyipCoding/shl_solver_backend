@@ -1,6 +1,15 @@
-from app.prompts.shl_analyze import system_prompt, user_prompt
+from app.prompts.shl_analyze import (
+    system_prompt,
+    user_prompt,
+    verify_code_system_template,
+    verify_code_user_message,
+)
 from app.utils.helpers import base64_to_bytes
-from app.schemas.shl_analyze import SHLAnalyzePayload
+from app.schemas.shl_analyze import (
+    SHLAnalyzePayload,
+    SHLCodeVerifyPayload,
+    SHLCodeVerifyResult,
+)
 from google.genai import types
 from app.clients.gemini import get_gemini_client
 import json
@@ -69,6 +78,89 @@ class SHLAnalyzeService:
 
         except Exception as e:
             print(f"Error during SHL analysis: {str(e)}")
+            raise e
+
+    async def verify_code(
+        self,
+        request: Request,
+        payload: SHLCodeVerifyPayload,
+        db: AsyncSession,
+    ) -> SHLCodeVerifyResult:
+        try:
+            language_display = "Python 3"
+            if payload.language == "java":
+                language_display = "Java"
+            elif payload.language == "javascript":
+                language_display = "JavaScript (Node.js)"
+
+            system_instruction = verify_code_system_template.format(
+                language_display=language_display
+            )
+
+            # Construct user message prompts
+            reference_code_part = types.Part.from_text(
+                text=f"Here is the reference code for comparison:\n```{payload.language}\n{payload.reference_code}\n```"
+            )
+            instruction_part = types.Part.from_text(text=verify_code_user_message)
+
+            user_parts = [instruction_part, reference_code_part]
+
+            # Process Image
+            if payload.image_data:
+                mime_type = getattr(payload.image_data, "mimeType", "image/jpeg")
+                base64_data = getattr(payload.image_data, "data", "")
+
+                if base64_data:
+                    image_bytes = base64_to_bytes(base64_data)
+                    image_part = types.Part.from_bytes(
+                        data=image_bytes, mime_type=mime_type
+                    )
+                    user_parts.append(image_part)
+
+            contents = [types.Content(role="user", parts=user_parts)]
+
+            client = get_gemini_client()
+            model_name = "gemini-3-flash-preview"
+
+            response = await client.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            if not response.text:
+                raise ValueError("Empty response from LLM")
+
+            # Clean up potential markdown code blocks in response
+            raw_text = response.text.strip()
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+
+            result_data = json.loads(raw_text.strip())
+
+            # Count tokens (approximate or get usage metadata if available)
+            prompt_token_count = 0
+            candidates_token_count = 0
+            if response.usage_metadata:
+                prompt_token_count = response.usage_metadata.prompt_token_count or 0
+                candidates_token_count = (
+                    response.usage_metadata.candidates_token_count or 0
+                )
+
+            total_tokens = prompt_token_count + candidates_token_count
+            await token_record_service.record_token_usage(
+                request, db, total_tokens, model=model_name
+            )
+
+            return SHLCodeVerifyResult(**result_data)
+
+        except Exception as e:
+            print(f"Error during code verification: {str(e)}")
             raise e
 
 

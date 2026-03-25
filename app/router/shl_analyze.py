@@ -3,7 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi_limiter.depends import RateLimiter
 
 from app.clients.db import get_db
-from app.schemas.shl_analyze import SHLAnalyzePayload, SHLAnalyzeResult
+from app.schemas.shl_analyze import (
+    SHLAnalyzePayload,
+    SHLAnalyzeResult,
+    SHLCodeVerifyPayload,
+    SHLCodeVerifyResult,
+)
 from app.services.shl_analyze import shl_service
 from app.schemas.response import APIResponse
 from app.services.llms import llms_service
@@ -69,4 +74,48 @@ async def process_shl_analyze(
             {"error": str(e)},
             status="failed",
         )
+        raise e
+
+
+@router.post(
+    "/verify-code",
+    response_model=APIResponse[SHLCodeVerifyResult],
+    dependencies=[
+        Depends(RateLimiter(times=5, seconds=60, identifier=ai_rate_limit_key)),
+    ],
+)
+async def process_code_verify(
+    request: Request,
+    payload: SHLCodeVerifyPayload,
+    # background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        # 1. AI代码纠错
+        # 不需要 llmId，内部固定使用 gemini-3-flash-preview
+        result = await shl_service.verify_code(request, payload, db)
+
+        # background_tasks.add_task(
+        #     handle_shl_analyze_background_task,
+        #     [payload.image_data] if payload.image_data else [],
+        #     request.state.user.id,
+        #     "gemini-3-flash-preview",
+        #     token_count,
+        #     result,
+        #     status="completed",
+        # )
+
+        return APIResponse(data=result)
+
+    except Exception as e:
+        # 记录失败的历史
+        # background_tasks.add_task(
+        #     handle_shl_analyze_background_task,
+        #     [payload.image_data] if payload.image_data else [],
+        #     request.state.user.id,
+        #     "gemini-3-flash-preview",
+        #     0,
+        #     {"error": str(e)},
+        #     status="failed",
+        # )
         raise e

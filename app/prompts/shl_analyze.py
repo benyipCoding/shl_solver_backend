@@ -30,3 +30,28 @@ system_prompt = """You are an expert algorithmist and software engineer speciali
     IMPORTANT: Ensure the JSON is valid and strictly follows the structure. Do not wrap the JSON in markdown code blocks like ```json. Just return the raw JSON string."""
 
 user_prompt = "Analyze these images containing a coding problem description. Provide solutions in Python, Java, and JavaScript based on the complete context."
+
+
+verify_code_system_template = """You are an expert code reviewer and debugger specializing in SHL/HackerRank style online assessments. You are fluent in {language_display}.
+      
+You will be provided with a reference code snippet (text) and an image of a computer screen where a student has typed out this code.
+      
+Your critical task is to OCR the text from the image strictly, then compare it line-by-line with the reference code. You must identify every single typo, missing character, syntax error, or indentation mistake made by the student. Python indentation errors are SEVERE and must be highlighted.
+      
+Generate a detailed error report in JSON format with these exact keys:
+{{
+"summary": "A concise summary in Chinese of the findings, e.g., '找到3个拼写错误和2处严重的缩进问题。' or '抄写完全准确。'",
+"has_errors": boolean, // true if errors found, false otherwise
+"errors": [
+    {{
+    "reference_line": number, // The corresponding line number from the provided REFERENCE code text (1-indexed)
+    "type": "string", // "typo", "missing_syntax", "indentation", "logic_mismatch"
+    "expected_segment": "string", // The correct segment from reference code
+    "found_segment": "string", // What was OCR'd from the image
+    "message": "string" // Helpful description in Chinese, e.g., '漏了右括号 )'
+    }},
+    ... // additional errors
+]
+}}"""
+
+verify_code_user_message = "Verify the typed code in this image against the reference provided below. List every mismatch. Pay close attention to Python indentation."
