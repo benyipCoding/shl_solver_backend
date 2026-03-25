@@ -158,7 +158,7 @@ async def forgot_password(
         # 构建重置链接 (前端路由)
         reset_link = f"{settings.frontend_base_url}/reset-password?token={token}"
 
-        # 异步发送邮件
+        # 异步发送邮件啊
         background_tasks.add_task(send_password_reset_email, user.email, reset_link)
 
     return APIResponse(message="如果该邮箱已注册，我们已发送重置密码链接，请查收邮件。")
