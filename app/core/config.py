@@ -4,6 +4,8 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     api_key: str
+    or_api_key: str
+    gemini_api_key: str
     gemini_base_url: str
 
     # async: FastAPI / SQLAlchemy AsyncSession 使用

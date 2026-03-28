@@ -5,6 +5,7 @@ from app.clients.gemini import init_gemini_client
 from app.core.config import settings
 from app.clients.db import init_db, close_db
 from app.clients.redis_client import init_redis, close_redis
+from app.clients.openrouter import init_openrouter_client
 
 
 @asynccontextmanager
@@ -12,6 +13,8 @@ async def lifespan(app: FastAPI):
     # ===== startup =====
     init_gemini_client()
     print("✅ Gemini client initialized")
+    # init_openrouter_client()
+    # print("✅ OpenRouter client initialized")
     # 初始化数据库（如果配置了 DATABASE_URL ）
     if settings.database_url_async:
         init_db(settings.database_url_async)
