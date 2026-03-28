@@ -5,7 +5,8 @@ from app.clients.gemini import init_gemini_client
 from app.core.config import settings
 from app.clients.db import init_db, close_db
 from app.clients.redis_client import init_redis, close_redis
-from app.clients.openrouter import init_openrouter_client
+
+# from app.clients.openrouter import init_openrouter_client
 
 
 @asynccontextmanager
