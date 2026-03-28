@@ -12,7 +12,8 @@ from app.schemas.shl_analyze import (
 )
 from google.genai import types
 from app.clients.gemini import get_gemini_client
-from app.clients.openrouter import get_openrouter_client
+
+# from app.clients.openrouter import get_openrouter_client
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.token_record import token_record_service
