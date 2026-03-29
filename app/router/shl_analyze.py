@@ -45,6 +45,9 @@ async def process_shl_analyze(
     try:
         # 1. 等待 AI 分析完成
         result, token_count = await shl_service.analyze(request, payload, db, llm.key)
+        # result, token_count = await shl_service.analyze_openrouter(
+        #     request, payload, db, llm.key
+        # )
 
         if isinstance(result, list):
             result = result[0] if result else {}
@@ -94,6 +97,7 @@ async def process_code_verify(
         # 1. AI代码纠错
         # 不需要 llmId，内部固定使用 gemini-3-flash-preview
         result = await shl_service.verify_code(request, payload, db)
+        # result = await shl_service.verify_code_openrouter(request, payload, db)
 
         # background_tasks.add_task(
         #     handle_shl_analyze_background_task,

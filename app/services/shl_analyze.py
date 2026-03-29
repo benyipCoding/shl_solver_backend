@@ -13,7 +13,7 @@ from app.schemas.shl_analyze import (
 from google.genai import types
 from app.clients.gemini import get_gemini_client
 
-# from app.clients.openrouter import get_openrouter_client
+from app.clients.openrouter import get_openrouter_client
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.token_record import token_record_service
@@ -168,144 +168,144 @@ class SHLAnalyzeService:
             print(f"Error during code verification: {str(e)}")
             raise e
 
-    # async def analyze_openrouter(
-    #     self,
-    #     request: Request,
-    #     payload: SHLAnalyzePayload,
-    #     db: AsyncSession,
-    #     llm_key: str,
-    # ):
-    #     try:
-    #         messages = []
-    #         if system_prompt:
-    #             messages.append({"role": "system", "content": system_prompt})
+    async def analyze_openrouter(
+        self,
+        request: Request,
+        payload: SHLAnalyzePayload,
+        db: AsyncSession,
+        llm_key: str,
+    ):
+        try:
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
 
-    #         user_content = []
-    #         if user_prompt:
-    #             user_content.append({"type": "text", "text": user_prompt})
+            user_content = []
+            if user_prompt:
+                user_content.append({"type": "text", "text": user_prompt})
 
-    #         for img in payload.images_data:
-    #             mime_type = getattr(img, "mimeType", "image/jpeg")
-    #             base64_data = getattr(img, "data", "")
+            for img in payload.images_data:
+                mime_type = getattr(img, "mimeType", "image/jpeg")
+                base64_data = getattr(img, "data", "")
 
-    #             if base64_data:
-    #                 # Constructor for base64 OpenRouter URL
-    #                 image_url = f"data:{mime_type};base64,{base64_data}"
-    #                 user_content.append(
-    #                     {"type": "image_url", "image_url": {"url": image_url}}
-    #                 )
-    #         if user_content:
-    #             messages.append({"role": "user", "content": user_content})
+                if base64_data:
+                    # Constructor for base64 OpenRouter URL
+                    image_url = f"data:{mime_type};base64,{base64_data}"
+                    user_content.append(
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    )
+            if user_content:
+                messages.append({"role": "user", "content": user_content})
 
-    #         client = get_openrouter_client()
+            client = get_openrouter_client()
 
-    #         response = await client.chat.completions.create(
-    #             model=llm_key,
-    #             messages=messages,
-    #             response_format={"type": "json_object"},
-    #         )
+            response = await client.chat.completions.create(
+                model=llm_key,
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
 
-    #         total_token_count = response.usage.total_tokens if response.usage else 0
+            total_token_count = response.usage.total_tokens if response.usage else 0
 
-    #         await token_record_service.record_token_usage(
-    #             request, db, total_token_count, model=llm_key
-    #         )
+            await token_record_service.record_token_usage(
+                request, db, total_token_count, model=llm_key
+            )
 
-    #         raw_text = (
-    #             response.choices[0].message.content.strip()
-    #             if response.choices and response.choices[0].message.content
-    #             else "{}"
-    #         )
-    #         if raw_text.startswith("```json"):
-    #             raw_text = raw_text[7:]
-    #         if raw_text.endswith("```"):
-    #             raw_text = raw_text[:-3]
+            raw_text = (
+                response.choices[0].message.content.strip()
+                if response.choices and response.choices[0].message.content
+                else "{}"
+            )
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
 
-    #         result = json.loads(raw_text.strip())
-    #         return result, total_token_count
+            result = json.loads(raw_text.strip())
+            return result, total_token_count
 
-    #     except Exception as e:
-    #         print(f"Error during SHL analysis with OpenRouter: {str(e)}")
-    #         raise e
+        except Exception as e:
+            print(f"Error during SHL analysis with OpenRouter: {str(e)}")
+            raise e
 
-    # async def verify_code_openrouter(
-    #     self,
-    #     request: Request,
-    #     payload: SHLCodeVerifyPayload,
-    #     db: AsyncSession,
-    # ) -> SHLCodeVerifyResult:
-    #     try:
-    #         language_display = "Python 3"
-    #         if payload.language == "java":
-    #             language_display = "Java"
-    #         elif payload.language == "javascript":
-    #             language_display = "JavaScript (Node.js)"
+    async def verify_code_openrouter(
+        self,
+        request: Request,
+        payload: SHLCodeVerifyPayload,
+        db: AsyncSession,
+    ) -> SHLCodeVerifyResult:
+        try:
+            language_display = "Python 3"
+            if payload.language == "java":
+                language_display = "Java"
+            elif payload.language == "javascript":
+                language_display = "JavaScript (Node.js)"
 
-    #         system_instruction = verify_code_system_template.format(
-    #             language_display=language_display
-    #         )
+            system_instruction = verify_code_system_template.format(
+                language_display=language_display
+            )
 
-    #         messages = [{"role": "system", "content": system_instruction}]
-    #         user_content = []
+            messages = [{"role": "system", "content": system_instruction}]
+            user_content = []
 
-    #         # Add instruction and reference code
-    #         user_content.append(
-    #             {
-    #                 "type": "text",
-    #                 "text": f"{verify_code_user_message}\n\nHere is the reference code for comparison:\n```{payload.language}\n{payload.reference_code}\n```",
-    #             }
-    #         )
+            # Add instruction and reference code
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": f"{verify_code_user_message}\n\nHere is the reference code for comparison:\n```{payload.language}\n{payload.reference_code}\n```",
+                }
+            )
 
-    #         # Process Image
-    #         if payload.image_data:
-    #             mime_type = getattr(payload.image_data, "mimeType", "image/jpeg")
-    #             base64_data = getattr(payload.image_data, "data", "")
+            # Process Image
+            if payload.image_data:
+                mime_type = getattr(payload.image_data, "mimeType", "image/jpeg")
+                base64_data = getattr(payload.image_data, "data", "")
 
-    #             if base64_data:
-    #                 image_url = f"data:{mime_type};base64,{base64_data}"
-    #                 user_content.append(
-    #                     {"type": "image_url", "image_url": {"url": image_url}}
-    #                 )
+                if base64_data:
+                    image_url = f"data:{mime_type};base64,{base64_data}"
+                    user_content.append(
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    )
 
-    #         if user_content:
-    #             messages.append({"role": "user", "content": user_content})
+            if user_content:
+                messages.append({"role": "user", "content": user_content})
 
-    #         client = get_openrouter_client()
-    #         model_name = (
-    #             "google/gemini-2.5-flash"  # Default OpenRouter model for verify
-    #         )
+            client = get_openrouter_client()
+            model_name = (
+                "google/gemini-2.5-flash"  # Default OpenRouter model for verify
+            )
 
-    #         response = await client.chat.completions.create(
-    #             model=model_name,
-    #             messages=messages,
-    #             response_format={"type": "json_object"},
-    #         )
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                response_format={"type": "json_object"},
+            )
 
-    #         if not response.choices or not response.choices[0].message.content:
-    #             raise ValueError("Empty response from LLM")
+            if not response.choices or not response.choices[0].message.content:
+                raise ValueError("Empty response from LLM")
 
-    #         raw_text = response.choices[0].message.content.strip()
+            raw_text = response.choices[0].message.content.strip()
 
-    #         if raw_text.startswith("```json"):
-    #             raw_text = raw_text[7:]
-    #         if raw_text.endswith("```"):
-    #             raw_text = raw_text[:-3]
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
 
-    #         result_data = json.loads(raw_text.strip())
+            result_data = json.loads(raw_text.strip())
 
-    #         if isinstance(result_data, list):
-    #             result_data = result_data[0] if result_data else {}
+            if isinstance(result_data, list):
+                result_data = result_data[0] if result_data else {}
 
-    #         total_tokens = response.usage.total_tokens if response.usage else 0
-    #         await token_record_service.record_token_usage(
-    #             request, db, total_tokens, model=model_name
-    #         )
+            total_tokens = response.usage.total_tokens if response.usage else 0
+            await token_record_service.record_token_usage(
+                request, db, total_tokens, model=model_name
+            )
 
-    #         return SHLCodeVerifyResult(**result_data)
+            return SHLCodeVerifyResult(**result_data)
 
-    #     except Exception as e:
-    #         print(f"Error during code verification with OpenRouter: {str(e)}")
-    #         raise e
+        except Exception as e:
+            print(f"Error during code verification with OpenRouter: {str(e)}")
+            raise e
 
 
 shl_service = SHLAnalyzeService()
