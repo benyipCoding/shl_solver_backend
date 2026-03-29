@@ -17,8 +17,8 @@ from app.utils.helpers import ai_rate_limit_key
 from app.utils.file_handler import (
     handle_shl_analyze_background_task,
 )
-from typing import List
-
+from app.services.wallet_service import wallet_service, InsufficientCreditsException
+from app.models.user import ActionType
 
 router = APIRouter(
     prefix="/shl_analyze", tags=["SHL Analyze"], dependencies=[Depends(verify_user)]
@@ -42,12 +42,26 @@ async def process_shl_analyze(
     if not llm or not llm.enabled:
         return APIResponse(message="LLM not found or disabled", code=404)
 
+    user_id = request.state.user.id
+
+    # ================= 1. 动态计费与流水类型判断 =================
+    # 根据 llm.key 判定是 Pro 还是 Flash，决定扣费金额和记录类型
+    is_pro = "pro" in llm.key.lower()
+    cost = 20 if is_pro else 5
+    action_type = ActionType.USE_PRO_MODEL if is_pro else ActionType.USE_FLASH_MODEL
+
+    # ================= 2. 事前扣费 =================
+    try:
+        await wallet_service.consume_credits(
+            db, user_id=user_id, amount=cost, action_type=action_type
+        )
+    except InsufficientCreditsException:
+        # 余额不足，直接返回 402 状态码，阻断后续所有 AI 请求
+        return APIResponse(message="算力点数不足，请充值", code=402)
+
     try:
         # 1. 等待 AI 分析完成
         result, token_count = await shl_service.analyze(request, payload, db, llm.key)
-        # result, token_count = await shl_service.analyze_openrouter(
-        #     request, payload, db, llm.key
-        # )
 
         if isinstance(result, list):
             result = result[0] if result else {}
@@ -77,6 +91,11 @@ async def process_shl_analyze(
             {"error": str(e)},
             status="failed",
         )
+
+        # AI 调用失败，务必将点数退还给用户
+        await wallet_service.refund_credits(
+            db, user_id=user_id, amount=cost, action_type=action_type
+        )
         raise e
 
 
@@ -90,36 +109,30 @@ async def process_shl_analyze(
 async def process_code_verify(
     request: Request,
     payload: SHLCodeVerifyPayload,
-    # background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
+    user_id = request.state.user.id
+    # 拍照纠错统一计费策略
+    cost = 2
+    action_type = ActionType.USE_VISION_DIFF
+
+    # ================= 1. 事前扣费 =================
+    try:
+        await wallet_service.consume_credits(
+            db, user_id=user_id, amount=cost, action_type=action_type
+        )
+    except InsufficientCreditsException:
+        return APIResponse(message="算力点数不足，请充值", code=402)
+
     try:
         # 1. AI代码纠错
         # 不需要 llmId，内部固定使用 gemini-3-flash-preview
         result = await shl_service.verify_code(request, payload, db)
-        # result = await shl_service.verify_code_openrouter(request, payload, db)
-
-        # background_tasks.add_task(
-        #     handle_shl_analyze_background_task,
-        #     [payload.image_data] if payload.image_data else [],
-        #     request.state.user.id,
-        #     "gemini-3-flash-preview",
-        #     token_count,
-        #     result,
-        #     status="completed",
-        # )
-
         return APIResponse(data=result)
 
     except Exception as e:
-        # 记录失败的历史
-        # background_tasks.add_task(
-        #     handle_shl_analyze_background_task,
-        #     [payload.image_data] if payload.image_data else [],
-        #     request.state.user.id,
-        #     "gemini-3-flash-preview",
-        #     0,
-        #     {"error": str(e)},
-        #     status="failed",
-        # )
+        # 如果 verify 失败，退还费用
+        await wallet_service.refund_credits(
+            db, user_id=user_id, amount=cost, action_type=action_type
+        )
         raise e

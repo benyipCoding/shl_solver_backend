@@ -4,6 +4,7 @@ from app.clients.db import get_db
 from app.schemas.response import APIResponse
 from app.schemas.auth import AuthRequest, ForgotPasswordRequest, ResetPasswordRequest
 from app.services.auth import auth_service
+from app.services.wallet_service import wallet_service
 from app.core.config import settings
 from app.clients.redis_client import get_redis
 import redis.asyncio as redis
@@ -33,6 +34,11 @@ async def register(
     user = await auth_service.create_user(
         db, username=username, email=payload.email, password=payload.password
     )
+
+    # 注册成功，赠送 50 点免费算力额度并记录流水
+    await wallet_service.create_wallet_with_bonus(db, user.id, 50)
+    await db.commit()
+
     return APIResponse(data=user)
 
 
