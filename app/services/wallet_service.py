@@ -1,7 +1,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from fastapi import HTTPException
-from app.models.user import UserCredit, UserCreditLog, CreditType, ActionType
+from app.models.user import User, UserCredit, UserCreditLog, CreditType, ActionType
 
 
 class InsufficientCreditsException(Exception):
@@ -11,6 +11,52 @@ class InsufficientCreditsException(Exception):
 
 
 class WalletService:
+    async def recharge_credit(self, db: AsyncSession, email: str, points: int) -> int:
+        """
+        根据邮箱给用户充值算力
+        返回充值后的总余额
+        """
+        # 1. 查找目标用户
+        stmt = select(User).where(User.email == email)
+        result = await db.execute(stmt)
+        target_user = result.scalar_one_or_none()
+
+        if not target_user:
+            raise HTTPException(status_code=404, detail="找不到该邮箱对应的用户")
+
+        # 2. 查钱包（加悲观锁防止并发问题）
+        c_stmt = (
+            select(UserCredit)
+            .where(UserCredit.user_id == target_user.id)
+            .with_for_update()
+        )
+        result = await db.execute(c_stmt)
+        wallet = result.scalar_one_or_none()
+
+        if not wallet:
+            # 如果没有钱包但需要充值，直接新建
+            wallet = UserCredit(
+                user_id=target_user.id, free_credits=0, paid_credits=points
+            )
+            db.add(wallet)
+            balance_after = points
+        else:
+            wallet.paid_credits += points
+            balance_after = wallet.free_credits + wallet.paid_credits
+
+        # 3. 记录流水
+        log = UserCreditLog(
+            user_id=target_user.id,
+            amount=points,
+            credit_type=CreditType.PAID,
+            action_type=ActionType.TOP_UP,
+            balance_after=balance_after,
+        )
+        db.add(log)
+
+        await db.commit()
+        return balance_after
+
     async def create_wallet_with_bonus(
         self, db: AsyncSession, user_id: int, bonus_amount: int
     ):
@@ -141,6 +187,22 @@ class WalletService:
             "paid_credits": wallet.paid_credits,
             "total": wallet.free_credits + wallet.paid_credits,
         }
+
+    async def get_credit_logs(
+        self, db: AsyncSession, user_id: int, skip: int = 0, limit: int = 100
+    ):
+        """
+        根据用户ID查询该用户的所有算力使用记录
+        """
+        stmt = (
+            select(UserCreditLog)
+            .where(UserCreditLog.user_id == user_id)
+            .order_by(UserCreditLog.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        return result.scalars().all()
 
 
 # 实例化为单例供其他模块引入

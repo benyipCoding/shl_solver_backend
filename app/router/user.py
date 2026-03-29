@@ -5,7 +5,8 @@ from app.services.user import user_service
 from app.services.wallet_service import wallet_service
 from app.depends.jwt_guard import verify_user
 from app.schemas.response import APIResponse
-from app.schemas.user import UserSerializer
+from app.schemas.user import UserSerializer, UserCreditLogSerializer
+from typing import List
 
 
 router = APIRouter(prefix="/user", tags=["User"], dependencies=[Depends(verify_user)])
@@ -25,6 +26,18 @@ async def read_user_balance(request: Request, db: AsyncSession = Depends(get_db)
     user = request.state.user
     balance = await wallet_service.get_balance(db, user.id)
     return APIResponse(data=balance)
+
+
+@router.get("/credit-logs", response_model=APIResponse[List[UserCreditLogSerializer]])
+async def read_user_credit_logs(
+    request: Request,
+    skip: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+):
+    user = request.state.user
+    logs = await wallet_service.get_credit_logs(db, user.id, skip=skip, limit=limit)
+    return APIResponse(data=logs)
 
 
 @router.get("/{user_id}", response_model=APIResponse[UserSerializer])

@@ -10,6 +10,7 @@ from app.router import (
     ai_doctor,
     excel_workbench,
     shl_solver,
+    wallet_credit,
 )
 from app.middlewares.auth import UserAuthMiddleware
 from app.middlewares.real_ip import RealIPMiddleware
@@ -44,6 +45,7 @@ api_router.include_router(user.router)
 api_router.include_router(ai_doctor.router)
 api_router.include_router(excel_workbench.router)
 api_router.include_router(shl_solver.router)
+api_router.include_router(wallet_credit.router)
 
 # 将总路由挂载到 app，配置公共前缀 /api_v1
 app.include_router(api_router, prefix="/api_v1")
