@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, Integer
+from sqlalchemy import Column, String, Boolean, Integer, Date
 from app.models.base import Base
 from app.models.mixins import TimestampMixin
 
@@ -17,3 +17,31 @@ class User(Base, TimestampMixin):
 
     def __repr__(self):
         return f"<User id={self.id} username={self.username} email={self.email}>"
+
+
+class UserCredit(Base, TimestampMixin):
+    __tablename__ = "user_credit"
+
+    user_id = Column(
+        Integer,
+        unique=True,
+        index=True,
+        nullable=False,
+        comment="关联用户",
+    )
+    free_credits = Column(
+        Integer,
+        default=0,
+        nullable=False,
+        comment="免费点数（比如每日重置的额度，或一次性赠送额度）",
+    )
+    paid_credits = Column(
+        Integer,
+        default=0,
+        nullable=False,
+        comment="付费点数（用户真金白银买的，永不过期）",
+    )
+    last_reset_date = Column(Date, nullable=True, comment="记录上次重置免费点数的日期")
+
+    def __repr__(self):
+        return f"<UserCredit id={self.id} user_id={self.user_id}>"
