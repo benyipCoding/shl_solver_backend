@@ -46,8 +46,7 @@ class WalletService:
         wallet = result.scalar_one_or_none()
 
         if not wallet:
-            # 容错：如果没有钱包记录，创建一个并赠送 50 点免费额度
-            wallet = await self.create_wallet_with_bonus(db, user_id, 50)
+            raise InsufficientCreditsException("算力点数不足")  # 没有钱包，视为没有点数
 
         # 2. 检查总余额
         if wallet.free_credits + wallet.paid_credits < amount:
@@ -125,6 +124,23 @@ class WalletService:
             )
             db.add(refund_log)
             await db.commit()
+
+    async def get_balance(self, db: AsyncSession, user_id: int):
+        """
+        根据用户ID查询算力余额
+        """
+        stmt = select(UserCredit).where(UserCredit.user_id == user_id)
+        result = await db.execute(stmt)
+        wallet = result.scalar_one_or_none()
+
+        if not wallet:
+            wallet = await self.create_wallet_with_bonus(db, user_id, 50)
+
+        return {
+            "free_credits": wallet.free_credits,
+            "paid_credits": wallet.paid_credits,
+            "total": wallet.free_credits + wallet.paid_credits,
+        }
 
 
 # 实例化为单例供其他模块引入
