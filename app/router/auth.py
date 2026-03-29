@@ -35,8 +35,7 @@ async def register(
         db, username=username, email=payload.email, password=payload.password
     )
 
-    # 注册成功，赠送 50 点免费算力额度并记录流水
-    await wallet_service.create_wallet_with_bonus(db, user.id, 50)
+    # await wallet_service.create_wallet_with_bonus(db, user.id, 50)
     await db.commit()
 
     return APIResponse(data=user)
