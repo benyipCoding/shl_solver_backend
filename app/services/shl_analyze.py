@@ -77,7 +77,7 @@ class SHLAnalyzeService:
                 raw_text = raw_text[:-3]
 
             # 兼容大模型输出中包含非标准 JSON 转义符（如 LaTeX 中的 \frac）导致 Invalid \escape 的问题
-            raw_text = re.sub(r'\\([^"\\/bfnrt])', r"\\\\\1", raw_text.strip())
+            raw_text = re.sub(r'(?<!\\)\\([^"\\/bfnrtu])', r"\\\\\1", raw_text.strip())
 
             result = json.loads(raw_text)
             return result, total_token_count
