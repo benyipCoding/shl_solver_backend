@@ -18,6 +18,7 @@ import json
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.token_record import token_record_service
 from fastapi import Request
+import re
 
 
 class SHLAnalyzeService:
@@ -75,7 +76,10 @@ class SHLAnalyzeService:
             if raw_text.endswith("```"):
                 raw_text = raw_text[:-3]
 
-            result = json.loads(raw_text.strip())
+            # 兼容大模型输出中包含非标准 JSON 转义符（如 LaTeX 中的 \frac）导致 Invalid \escape 的问题
+            raw_text = re.sub(r'\\([^"\\/bfnrt])', r"\\\\\1", raw_text.strip())
+
+            result = json.loads(raw_text)
             return result, total_token_count
 
         except Exception as e:
