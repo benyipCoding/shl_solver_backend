@@ -33,10 +33,6 @@ class AIDoctorService:
             "total_token_count"
         ]
 
-        await token_record_service.record_token_usage(
-            request, db, total_token_count, model=payload.llmKey
-        )
-
         # 将分析结果返回给调用方
         result = json.loads(response.text)
         return result

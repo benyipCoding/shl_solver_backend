@@ -1,8 +1,9 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from fastapi import HTTPException
-from app.models.user import User, UserCredit, UserCreditLog, CreditType, ActionType
+from app.models.user import User, UserCredit, UserCreditLog, CreditType
 from datetime import datetime, timezone
+from app.models.shl_solver import ActionType
 
 
 class InsufficientCreditsException(Exception):

@@ -2,6 +2,7 @@ import enum
 from sqlalchemy import Column, String, Boolean, Integer, Date, BigInteger, Enum
 from app.models.base import Base
 from app.models.mixins import TimestampMixin
+from app.models.shl_solver import ActionType
 
 
 class User(Base, TimestampMixin):
@@ -51,15 +52,6 @@ class UserCredit(Base, TimestampMixin):
 class CreditType(str, enum.Enum):
     FREE = "FREE"
     PAID = "PAID"
-
-
-class ActionType(str, enum.Enum):
-    SIGNUP_BONUS = "SIGNUP_BONUS"
-    DAILY_REFILL = "DAILY_REFILL"
-    USE_FLASH_MODEL = "USE_FLASH_MODEL"
-    USE_PRO_MODEL = "USE_PRO_MODEL"
-    USE_VISION_DIFF = "USE_VISION_DIFF"
-    TOP_UP = "TOP_UP"
 
 
 class UserCreditLog(Base, TimestampMixin):

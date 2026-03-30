@@ -1,29 +1,24 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.token_record import TokenRecord
-from fastapi import Request
-
-# from sqlalchemy import select
 
 
 class TokenRecordService:
     async def record_token_usage(
         self,
-        request: Request,
+        ip: str,
+        request_path: str,
+        user_id: int,
         db: AsyncSession,
         token_count: int,
         model: str = None,
     ):
         try:
             record = TokenRecord(
-                ip=getattr(request.state, "real_ip", request.client.host),
+                ip=ip,
                 token_count=token_count,
                 model=model,
-                user_id=(
-                    getattr(request.state, "user", None).id
-                    if getattr(request.state, "user", None)
-                    else None
-                ),
-                request_path=request.url.path,
+                user_id=user_id,
+                request_path=request_path,
             )
             db.add(record)
             await db.commit()

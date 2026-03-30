@@ -16,7 +16,6 @@ from app.clients.gemini import get_gemini_client
 from app.clients.openrouter import get_openrouter_client
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.services.token_record import token_record_service
 from fastapi import Request
 import re
 
@@ -24,9 +23,7 @@ import re
 class SHLAnalyzeService:
     async def analyze(
         self,
-        request: Request,
         payload: SHLAnalyzePayload,
-        db: AsyncSession,
         llm_key: str,
     ):
         """
@@ -63,11 +60,6 @@ class SHLAnalyzeService:
             )
 
             total_token_count = response.usage_metadata.total_token_count
-            # 把token数量记录到数据库里，方便后续统计和分析
-            # TODO: 可以考虑把每次调用的token数量和用户ID、调用时间等信息一起记录下来，做更细粒度的分析
-            await token_record_service.record_token_usage(
-                request, db, total_token_count, model=llm_key
-            )
 
             # 增加一点防御性清理逻辑
             raw_text = response.text.strip()
@@ -80,6 +72,10 @@ class SHLAnalyzeService:
             raw_text = re.sub(r'(?<!\\)\\([^"\\/bfnrtu])', r"\\\\\1", raw_text.strip())
 
             result = json.loads(raw_text)
+
+            if isinstance(result, list):
+                result = result[0] if result else {}
+
             return result, total_token_count
 
         except Exception as e:
@@ -88,10 +84,8 @@ class SHLAnalyzeService:
 
     async def verify_code(
         self,
-        request: Request,
         payload: SHLCodeVerifyPayload,
-        db: AsyncSession,
-    ) -> SHLCodeVerifyResult:
+    ) -> tuple[SHLCodeVerifyResult, int]:
         try:
             language_display = "Python 3"
             if payload.language == "java":
@@ -162,11 +156,8 @@ class SHLAnalyzeService:
                 )
 
             total_tokens = prompt_token_count + candidates_token_count
-            await token_record_service.record_token_usage(
-                request, db, total_tokens, model=model_name
-            )
 
-            return SHLCodeVerifyResult(**result_data)
+            return SHLCodeVerifyResult(**result_data), total_tokens
 
         except Exception as e:
             print(f"Error during code verification: {str(e)}")
@@ -210,10 +201,6 @@ class SHLAnalyzeService:
             )
 
             total_token_count = response.usage.total_tokens if response.usage else 0
-
-            await token_record_service.record_token_usage(
-                request, db, total_token_count, model=llm_key
-            )
 
             raw_text = (
                 response.choices[0].message.content.strip()
@@ -301,9 +288,6 @@ class SHLAnalyzeService:
                 result_data = result_data[0] if result_data else {}
 
             total_tokens = response.usage.total_tokens if response.usage else 0
-            await token_record_service.record_token_usage(
-                request, db, total_tokens, model=model_name
-            )
 
             return SHLCodeVerifyResult(**result_data)
 

@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, Boolean, Integer
 from app.models.base import Base
 from app.models.mixins import TimestampMixin
+import enum
 
 
 class SHLSolverHistory(Base, TimestampMixin):
@@ -23,3 +24,12 @@ class SHLSolverHistory(Base, TimestampMixin):
     error_message = Column(
         String, nullable=True
     )  # 可选字段，记录求解过程中出现的错误信息
+
+
+class ActionType(str, enum.Enum):
+    SIGNUP_BONUS = "SIGNUP_BONUS"
+    DAILY_REFILL = "DAILY_REFILL"
+    USE_FLASH_MODEL = "USE_FLASH_MODEL"
+    USE_PRO_MODEL = "USE_PRO_MODEL"
+    USE_VISION_DIFF = "USE_VISION_DIFF"
+    TOP_UP = "TOP_UP"

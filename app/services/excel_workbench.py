@@ -34,9 +34,6 @@ class ExcelWorkbenchService:
             total_token_count = int(
                 json.loads(response.json())["usage_metadata"]["total_token_count"]
             )
-            await token_record_service.record_token_usage(
-                request, db, total_token_count, model=llm_key
-            )
 
             if response.parsed:
                 # 如果 AIResponseSchema 是 Pydantic 模型，直接利用 FastAPI 的自动序列化返回字典

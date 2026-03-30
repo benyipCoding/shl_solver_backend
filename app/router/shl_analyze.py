@@ -1,9 +1,7 @@
-import traceback
 import asyncio
 from fastapi import APIRouter, Depends, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi_limiter.depends import RateLimiter
-
 from app.utils.alert_utils import send_email_alert
 from app.clients.db import get_db
 from app.schemas.shl_analyze import (
@@ -17,11 +15,16 @@ from app.schemas.response import APIResponse
 from app.services.llms import llms_service
 from app.depends.jwt_guard import verify_user
 from app.utils.helpers import ai_rate_limit_key
-from app.utils.file_handler import (
-    handle_shl_analyze_background_task,
-)
+
 from app.services.wallet_service import wallet_service, InsufficientCreditsException
-from app.models.user import ActionType
+from app.models.shl_solver import ActionType
+
+# 引入模型和枚举
+from app.models.ai_task import AITask, TaskStatus
+from app.services.task_worker import background_shl_solver_task
+from sqlalchemy.future import select
+import traceback
+
 
 router = APIRouter(
     prefix="/shl_analyze", tags=["SHL Analyze"], dependencies=[Depends(verify_user)]
@@ -30,9 +33,9 @@ router = APIRouter(
 
 @router.post(
     "",
-    response_model=APIResponse[SHLAnalyzeResult],
+    # response_model=APIResponse[SHLAnalyzeResult],
     dependencies=[
-        Depends(RateLimiter(times=1, seconds=60, identifier=ai_rate_limit_key)),
+        Depends(RateLimiter(times=2, seconds=60, identifier=ai_rate_limit_key)),
     ],
 )
 async def process_shl_analyze(
@@ -46,6 +49,8 @@ async def process_shl_analyze(
         return APIResponse(message="LLM not found or disabled", code=404)
 
     user_id = request.state.user.id
+    client_ip = getattr(request.state, "real_ip", request.client.host)
+    req_path = request.url.path
 
     # ================= 1. 动态计费与流水类型判断 =================
     # 根据 llm.key 判定是 Pro 还是 Flash，决定扣费金额和记录类型
@@ -63,66 +68,36 @@ async def process_shl_analyze(
         return APIResponse(message="算力点数不足，请充值", code=402)
 
     try:
-        # 1. 等待 AI 分析完成
-        result, token_count = await shl_service.analyze(request, payload, db, llm.key)
+        # 3. 创建 PENDING 状态的任务记录
+        new_task = AITask(
+            user_id=user_id, task_type="SHL_ANALYZE", status=TaskStatus.PENDING
+        )
+        db.add(new_task)
+        await db.commit()
+        await db.refresh(new_task)
 
-        if isinstance(result, list):
-            result = result[0] if result else {}
-
-        # 2. 分析成功后，将保存图片的任务以及历史记录挂载到后台执行
-        # 这样代码会立刻执行下一步 return，不会在此处发生硬盘 I/O 阻塞
+        # 4. 把耗时工作丢进后台
         background_tasks.add_task(
-            handle_shl_analyze_background_task,
-            payload.images_data,
-            request.state.user.id,
-            llm.key,
-            token_count,
-            result,
-            status="completed",
+            background_shl_solver_task,
+            task_id=new_task.task_id,
+            user_id=user_id,
+            payload=payload,
+            llm_key=llm.key,
+            cost=cost,
+            action_type=action_type,
+            ip=client_ip,
+            request_path=req_path,
         )
 
-        return APIResponse(data=result)
-
-    except asyncio.CancelledError:
-        # FastAPI 请求被客户端断开/超时时抛出
-        # 不能 raise 否则 FastAPI 不会执行 background_tasks，退还费用并记录
-        background_tasks.add_task(
-            handle_shl_analyze_background_task,
-            payload.images_data,
-            request.state.user.id,
-            llm.key,
-            0,
-            {"error": "client disconnected / request timeout"},
-            status="failed",
+        return APIResponse(
+            data={"task_id": new_task.task_id, "status": TaskStatus.PENDING.value}
         )
-        # 退还扣除的点数
-        await wallet_service.refund_credits(
-            db, user_id=user_id, amount=cost, action_type=action_type
-        )
-        return APIResponse(message="Request cancelled by client", code=499)
 
     except Exception as e:
-        # 3. 如果分析失败，也要记录失败的历史
-        background_tasks.add_task(
-            handle_shl_analyze_background_task,
-            payload.images_data,
-            request.state.user.id,
-            llm.key,
-            0,
-            {"error": str(e)},
-            status="failed",
-        )
-
-        # AI 调用失败，务必将点数退还给用户
-        await wallet_service.refund_credits(
-            db, user_id=user_id, amount=cost, action_type=action_type
-        )
-        # 手动触发报警邮件逻辑
-        error_msg = traceback.format_exc()
-        alert_text = f"🚨 后端服务报警 (AI分析失败)\n\nURL: {request.url}\nMethod: {request.method}\nError: {str(e)}\n\nTraceback:\n{error_msg}"
-        asyncio.create_task(asyncio.to_thread(send_email_alert, alert_text))
-
-        return APIResponse(message=f"分析失败: {str(e)}", code=500)
+        await db.rollback()
+        # 创建任务失败时的兜底退款
+        await wallet_service.refund_credits(db, user_id, cost, action_type)
+        raise e
 
 
 @router.post(
@@ -153,10 +128,11 @@ async def process_code_verify(
     try:
         # 1. AI代码纠错
         # 不需要 llmId，内部固定使用 gemini-3-flash-preview
-        result = await shl_service.verify_code(request, payload, db)
+        result, total_token = await shl_service.verify_code(payload)
         return APIResponse(data=result)
 
     except asyncio.CancelledError:
+        await db.rollback()
         # 如果 verify 因客户端断开被取消，退费
         await wallet_service.refund_credits(
             db, user_id=user_id, amount=cost, action_type=action_type
@@ -164,13 +140,57 @@ async def process_code_verify(
         return APIResponse(message="Request cancelled by client", code=499)
 
     except Exception as e:
+        await db.rollback()
         # 如果 verify 失败，退还费用
         await wallet_service.refund_credits(
             db, user_id=user_id, amount=cost, action_type=action_type
         )
-        # # 手动触发报警邮件逻辑
-        # error_msg = traceback.format_exc()
-        # alert_text = f"🚨 后端服务报警 (AI纠错失败)\n\nURL: {request.url}\nMethod: {request.method}\nError: {str(e)}\n\nTraceback:\n{error_msg}"
-        # asyncio.create_task(asyncio.to_thread(send_email_alert, alert_text))
+        # 手动触发报警邮件逻辑
+        error_msg = traceback.format_exc()
+        alert_text = f"🚨 后端服务报警 (AI纠错失败)\n\nURL: {request.url}\nMethod: {request.method}\nError: {str(e)}\n\nTraceback:\n{error_msg}"
+        asyncio.create_task(asyncio.to_thread(send_email_alert, alert_text))
 
         return APIResponse(message=f"纠错失败: {str(e)}", code=500)
+
+
+# ==========================================
+# 3. 轮询查询任务进度 (GET)
+# ==========================================
+@router.get(
+    "/task/{task_id}",
+    dependencies=[
+        Depends(
+            RateLimiter(times=30, seconds=60, identifier=ai_rate_limit_key)
+        ),  # 允许较高频率的轮询
+    ],
+)
+async def get_task_status(
+    request: Request,
+    task_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    user_id = request.state.user.id
+
+    stmt = select(AITask).where(AITask.task_id == task_id)
+    result = await db.execute(stmt)
+    task = result.scalars().first()
+
+    if not task:
+        return APIResponse(message="任务不存在", code=404)
+
+    # 安全隔离：自己的任务自己看
+    if task.user_id != user_id:
+        return APIResponse(message="无权访问该任务", code=403)
+
+    response_data = {
+        "task_id": task.task_id,
+        "status": task.status.value,
+        "task_type": task.task_type,
+    }
+
+    if task.status == TaskStatus.COMPLETED:
+        response_data["result"] = task.result
+    elif task.status == TaskStatus.FAILED:
+        response_data["error"] = task.error_message
+
+    return APIResponse(data=response_data)

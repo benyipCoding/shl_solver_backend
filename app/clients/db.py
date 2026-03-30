@@ -22,6 +22,7 @@ def init_db(database_url: str) -> None:
     async_session = async_sessionmaker(
         engine, expire_on_commit=False, class_=AsyncSession
     )
+    return async_session
 
 
 async def close_db() -> None:

@@ -1,7 +1,8 @@
 from pydantic import BaseModel, EmailStr, field_validator
 from datetime import datetime
 from typing import Optional
-from app.models.user import CreditType, ActionType
+from app.models.user import CreditType
+from app.models.shl_solver import ActionType
 
 
 class UserSerializer(BaseModel):
