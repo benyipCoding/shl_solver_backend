@@ -24,6 +24,7 @@ class SHLSolverHistory(Base, TimestampMixin):
     error_message = Column(
         String, nullable=True
     )  # 可选字段，记录求解过程中出现的错误信息
+    is_readed = Column(Boolean, default=False, nullable=True)  # 记录用户是否已查看结果
 
 
 class ActionType(str, enum.Enum):

@@ -39,6 +39,7 @@ class SHLSolverHistorySerializer(BaseModel):
     passed_test_cases: int
     status: str
     error_message: Optional[str] = None
+    is_readed: Optional[bool] = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -50,3 +51,7 @@ class SHLSolverHistoryListResponse(BaseModel):
     total: int
     page: int
     size: int
+
+
+class SHLSolverHistoryPatch(BaseModel):
+    is_readed: Optional[bool] = None
