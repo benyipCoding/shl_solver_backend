@@ -181,28 +181,27 @@ class WalletService:
         wallet = result.scalar_one_or_none()
 
         if not wallet:
-            # 查找该用户，判断其注册时间
-            u_stmt = select(User).where(User.id == user_id)
-            u_result = await db.execute(u_stmt)
-            target_user = u_result.scalar_one_or_none()
+            # # 查找该用户，判断其注册时间
+            # u_stmt = select(User).where(User.id == user_id)
+            # u_result = await db.execute(u_stmt)
+            # target_user = u_result.scalar_one_or_none()
 
-            if target_user and target_user.created_at:
-                created_at = target_user.created_at
-                # 为了比较安全，处理 tzinfo
-                if created_at.tzinfo is None:
-                    created_at = created_at.replace(tzinfo=timezone.utc)
+            # if target_user and target_user.created_at:
+            #     created_at = target_user.created_at
+            #     # 为了比较安全，处理 tzinfo
+            #     if created_at.tzinfo is None:
+            #         created_at = created_at.replace(tzinfo=timezone.utc)
 
-                cutoff_date = datetime(2026, 4, 1, tzinfo=timezone.utc)
-                if created_at < cutoff_date:
-                    # 如果是26年4月1日前注册的，则赠送50点
-                    wallet = await self.create_wallet_with_bonus(db, user_id, 50)
-                    await db.commit()
-                    return {
-                        "free_credits": wallet.free_credits,
-                        "paid_credits": wallet.paid_credits,
-                        "total": wallet.free_credits + wallet.paid_credits,
-                    }
-
+            #     cutoff_date = datetime(2026, 4, 1, tzinfo=timezone.utc)
+            #     if created_at < cutoff_date:
+            #         # 如果是26年4月1日前注册的，则赠送50点
+            #         wallet = await self.create_wallet_with_bonus(db, user_id, 50)
+            #         await db.commit()
+            #         return {
+            #             "free_credits": wallet.free_credits,
+            #             "paid_credits": wallet.paid_credits,
+            #             "total": wallet.free_credits + wallet.paid_credits,
+            #         }
             return {
                 "free_credits": 0,
                 "paid_credits": 0,
