@@ -2,6 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from fastapi import HTTPException
 from app.models.user import User, UserCredit, UserCreditLog, CreditType, ActionType
+from datetime import datetime, timezone
 
 
 class InsufficientCreditsException(Exception):
@@ -180,8 +181,6 @@ class WalletService:
         wallet = result.scalar_one_or_none()
 
         if not wallet:
-            from datetime import datetime, timezone
-
             # 查找该用户，判断其注册时间
             u_stmt = select(User).where(User.id == user_id)
             u_result = await db.execute(u_stmt)
