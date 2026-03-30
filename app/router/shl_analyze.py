@@ -83,6 +83,24 @@ async def process_shl_analyze(
 
         return APIResponse(data=result)
 
+    except asyncio.CancelledError:
+        # FastAPI 请求被客户端断开/超时时抛出
+        # 不能 raise 否则 FastAPI 不会执行 background_tasks，退还费用并记录
+        background_tasks.add_task(
+            handle_shl_analyze_background_task,
+            payload.images_data,
+            request.state.user.id,
+            llm.key,
+            0,
+            {"error": "client disconnected / request timeout"},
+            status="failed",
+        )
+        # 退还扣除的点数
+        await wallet_service.refund_credits(
+            db, user_id=user_id, amount=cost, action_type=action_type
+        )
+        return APIResponse(message="Request cancelled by client", code=499)
+
     except Exception as e:
         # 3. 如果分析失败，也要记录失败的历史
         background_tasks.add_task(
@@ -137,6 +155,13 @@ async def process_code_verify(
         # 不需要 llmId，内部固定使用 gemini-3-flash-preview
         result = await shl_service.verify_code(request, payload, db)
         return APIResponse(data=result)
+
+    except asyncio.CancelledError:
+        # 如果 verify 因客户端断开被取消，退费
+        await wallet_service.refund_credits(
+            db, user_id=user_id, amount=cost, action_type=action_type
+        )
+        return APIResponse(message="Request cancelled by client", code=499)
 
     except Exception as e:
         # 如果 verify 失败，退还费用
