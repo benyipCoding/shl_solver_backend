@@ -192,9 +192,9 @@ class WalletService:
                 if created_at.tzinfo is None:
                     created_at = created_at.replace(tzinfo=timezone.utc)
 
-                cutoff_date = datetime(2026, 4, 5, tzinfo=timezone.utc)
+                cutoff_date = datetime(2026, 4, 1, tzinfo=timezone.utc)
                 if created_at < cutoff_date:
-                    # 如果是26年4月5日前注册的，则赠送50点
+                    # 如果是26年4月1日前注册的，则赠送50点
                     wallet = await self.create_wallet_with_bonus(db, user_id, 50)
                     await db.commit()
                     return {
