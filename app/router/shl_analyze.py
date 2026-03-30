@@ -1,7 +1,10 @@
+import traceback
+import asyncio
 from fastapi import APIRouter, Depends, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi_limiter.depends import RateLimiter
 
+from app.utils.alert_utils import send_email_alert
 from app.clients.db import get_db
 from app.schemas.shl_analyze import (
     SHLAnalyzePayload,
@@ -96,7 +99,12 @@ async def process_shl_analyze(
         await wallet_service.refund_credits(
             db, user_id=user_id, amount=cost, action_type=action_type
         )
-        raise e
+        # 手动触发报警邮件逻辑
+        error_msg = traceback.format_exc()
+        alert_text = f"🚨 后端服务报警 (AI分析失败)\n\nURL: {request.url}\nMethod: {request.method}\nError: {str(e)}\n\nTraceback:\n{error_msg}"
+        asyncio.create_task(asyncio.to_thread(send_email_alert, alert_text))
+
+        return APIResponse(message=f"分析失败: {str(e)}", code=500)
 
 
 @router.post(
@@ -135,4 +143,9 @@ async def process_code_verify(
         await wallet_service.refund_credits(
             db, user_id=user_id, amount=cost, action_type=action_type
         )
-        raise e
+        # # 手动触发报警邮件逻辑
+        # error_msg = traceback.format_exc()
+        # alert_text = f"🚨 后端服务报警 (AI纠错失败)\n\nURL: {request.url}\nMethod: {request.method}\nError: {str(e)}\n\nTraceback:\n{error_msg}"
+        # asyncio.create_task(asyncio.to_thread(send_email_alert, alert_text))
+
+        return APIResponse(message=f"纠错失败: {str(e)}", code=500)
