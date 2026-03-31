@@ -30,6 +30,10 @@ router = APIRouter(
     prefix="/shl_analyze", tags=["SHL Analyze"], dependencies=[Depends(verify_user)]
 )
 
+GEMINI_PRO_COST = 30
+GEMINI_FLASH_COST = 10
+VERIFY_CODE_COST = 5
+
 
 @router.post(
     "",
@@ -55,7 +59,7 @@ async def process_shl_analyze(
     # ================= 1. 动态计费与流水类型判断 =================
     # 根据 llm.key 判定是 Pro 还是 Flash，决定扣费金额和记录类型
     is_pro = "pro" in llm.key.lower()
-    cost = 20 if is_pro else 5
+    cost = GEMINI_PRO_COST if is_pro else GEMINI_FLASH_COST
     action_type = ActionType.USE_PRO_MODEL if is_pro else ActionType.USE_FLASH_MODEL
 
     # ================= 2. 事前扣费 =================
@@ -114,7 +118,7 @@ async def process_code_verify(
 ):
     user_id = request.state.user.id
     # 拍照纠错统一计费策略
-    cost = 2
+    cost = VERIFY_CODE_COST
     action_type = ActionType.USE_VISION_DIFF
 
     # ================= 1. 事前扣费 =================
