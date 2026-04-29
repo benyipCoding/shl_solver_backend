@@ -6,6 +6,7 @@ from app.router import (
     captcha,
     shl_analyze,
     llms,
+    ff14,
     user,
     ai_doctor,
     excel_workbench,
@@ -41,6 +42,7 @@ api_router.include_router(auth.router)
 api_router.include_router(captcha.router)
 api_router.include_router(shl_analyze.router)
 api_router.include_router(llms.router)
+api_router.include_router(ff14.router)
 api_router.include_router(user.router)
 api_router.include_router(ai_doctor.router)
 api_router.include_router(excel_workbench.router)

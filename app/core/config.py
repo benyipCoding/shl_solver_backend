@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     smtp_server: str = "smtp.qq.com"
     smtp_port: int = 465
 
+    # FF14
+    ff14_api_key: str
+    ff14_base_url: str
+
     frontend_base_url: str = "http://localhost:3000"
 
     class Config:
