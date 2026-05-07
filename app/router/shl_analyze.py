@@ -52,6 +52,9 @@ async def process_shl_analyze(
     if not llm or not llm.enabled:
         return APIResponse(message="LLM not found or disabled", code=404)
 
+    raise ValueError(
+        "测试异常，触发全局异常捕获"
+    )  # 故意抛出异常，测试全局异常捕获和报警机制
     user_id = request.state.user.id
     client_ip = getattr(request.state, "real_ip", request.client.host)
     req_path = request.url.path
