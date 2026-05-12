@@ -13,7 +13,7 @@ from app.schemas.user import UserSerializer
 from fastapi import HTTPException, status
 import uuid
 from app.utils.email_helper import send_password_reset_email
-
+from app.clients.posthog_client import capture_event, identify_user
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -21,9 +21,19 @@ ACCESS_TOKEN_KEY = "access_token"
 REFRESH_TOKEN_KEY = "refresh_token"
 
 
+def get_client_ip(request: Request) -> str:
+    # 优先从 middleware (如已设置) 提取，否则用 request.client.host
+    return getattr(
+        request.state, "real_ip", request.client.host if request.client else ""
+    )
+
+
 @router.post("/register", response_model=APIResponse[UserSerializer])
 async def register(
-    payload: AuthRequest, response: Response, db: AsyncSession = Depends(get_db)
+    payload: AuthRequest,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
 ):
     # Only email & password provided by frontend. Use email local part as username.
     existing = await auth_service.get_by_email(db, payload.email)
@@ -38,12 +48,30 @@ async def register(
     # await wallet_service.create_wallet_with_bonus(db, user.id, 50)
     await db.commit()
 
+    # ---- 记录埋点数据 ----
+    identify_user(
+        str(user.id),
+        properties={
+            "email": user.email,
+            "username": user.username,
+        },
+    )
+    capture_event(
+        str(user.id),
+        "user_signed_up",
+        properties={
+            "$ip": get_client_ip(request),
+            "$user_agent": request.headers.get("user-agent", ""),
+        },
+    )
+
     return APIResponse(data=user)
 
 
 @router.post("/login", response_model=APIResponse[UserSerializer])
 async def login(
     payload: AuthRequest,
+    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
     redis: redis.Redis = Depends(get_redis),
@@ -75,6 +103,16 @@ async def login(
         secure=settings.cookie_secure,
         samesite=settings.cookie_samesite,
         max_age=settings.jwt_refresh_token_expires_days * 24 * 3600,
+    )
+
+    # ---- 记录埋点数据 ----
+    capture_event(
+        str(user.id),
+        "user_logged_in",
+        properties={
+            "$ip": get_client_ip(request),
+            "$user_agent": request.headers.get("user-agent", ""),
+        },
     )
 
     return APIResponse(data=user)

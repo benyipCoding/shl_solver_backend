@@ -24,6 +24,7 @@ from app.models.ai_task import AITask, TaskStatus
 from app.services.task_worker import background_shl_solver_task
 from sqlalchemy.future import select
 import traceback
+from app.clients.posthog_client import capture_event
 
 
 router = APIRouter(
@@ -91,6 +92,19 @@ async def process_shl_analyze(
             action_type=action_type,
             ip=client_ip,
             request_path=req_path,
+        )
+
+        capture_event(
+            str(user_id),
+            "ai_task_started",
+            properties={
+                "task_type": "SHL_ANALYZE",
+                "llm_key": llm.key,
+                "cost": cost,
+                "is_pro": is_pro,
+                "$ip": client_ip,
+                "$user_agent": request.headers.get("user-agent", ""),
+            },
         )
 
         return APIResponse(

@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     twelve_data_api_key: str
     twelve_data_base_url: str
 
+    # PostHog
+    posthog_api_key: str
+    posthog_host: str
+
     frontend_base_url: str = "http://localhost:3000"
 
     class Config:

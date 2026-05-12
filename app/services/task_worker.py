@@ -14,6 +14,7 @@ from app.utils.file_handler import (
     handle_shl_analyze_background_task,
 )
 from app.utils.alert_utils import send_email_alert
+from app.clients.posthog_client import capture_event
 
 
 async def background_shl_solver_task(
@@ -79,6 +80,20 @@ async def background_shl_solver_task(
                 status="completed",
             )
 
+            # ---- 记录埋点数据 ----
+            capture_event(
+                str(user_id),
+                "ai_task_completed",
+                properties={
+                    "task_type": "SHL_ANALYZE",
+                    "task_id": task_id,
+                    "llm_key": llm_key,
+                    "token_count": token_count,
+                    "cost": cost,
+                    "$ip": ip,
+                },
+            )
+
         except Exception as e:
             print(f"后台任务 {task_id} 执行失败: {e}")
 
@@ -104,6 +119,20 @@ async def background_shl_solver_task(
                 db=db, user_id=user_id, amount=cost, action_type=action_type
             )
             await db.commit()
+
+            # ---- 记录埋点数据 ----
+            capture_event(
+                str(user_id),
+                "ai_task_failed",
+                properties={
+                    "task_type": "SHL_ANALYZE",
+                    "task_id": task_id,
+                    "llm_key": llm_key,
+                    "error_msg": str(e),
+                    "cost_refunded": cost,
+                    "$ip": ip,
+                },
+            )
 
             await handle_shl_analyze_background_task(
                 images_data=payload.images_data,
