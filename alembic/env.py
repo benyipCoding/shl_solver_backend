@@ -10,6 +10,12 @@ from app.models.llms import LLMs
 from app.models.token_record import TokenRecord
 from app.models.shl_solver import SHLSolverHistory
 from app.models.ai_task import AITask
+from app.models.market_data import (
+    MarketBarSyncState,
+    MarketInstrument,
+    MarketInstrumentAlias,
+    MarketOHLCVBar,
+)
 from app.core.config import settings
 
 # this is the Alembic Config object, which provides
