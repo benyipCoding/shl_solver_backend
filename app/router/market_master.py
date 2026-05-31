@@ -13,7 +13,7 @@ from app.utils.helpers import ai_rate_limit_key
 router = APIRouter(
     prefix="/market_master",
     tags=["Market Master"],
-    dependencies=[Depends(verify_user)],
+    # dependencies=[Depends(verify_user)],
 )
 
 
@@ -54,8 +54,8 @@ async def _service_response(
     response_model=APIResponse[Any],
     summary="获取最新价格",
     description=(
-        "代理 Twelve Data 官方 /price REST 接口。免费方案只要 API Key 有效即可调用；"
-        "若使用 figi、prepost 等高级参数，官方会按套餐权限决定是否返回 403。"
+        "使用 FXCM sidecar 返回最新价格。当前以 symbol 为主键做映射；"
+        "对外保留兼容路径，便于前端无感切换。"
     ),
     dependencies=[
         Depends(
@@ -75,15 +75,15 @@ async def get_latest_price(
     ),
     figi: str | None = Query(
         None,
-        description="FIGI 标识，可选。官方文档标注为 Ultra/Enterprise 及以上套餐可用。",
+        description="FIGI 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     isin: str | None = Query(
         None,
-        description="ISIN 标识，可选。官方文档标注为 Data add-ons 能力。",
+        description="ISIN 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     cusip: str | None = Query(
         None,
-        description="CUSIP 标识，可选。官方文档标注为 Data add-ons 能力。",
+        description="CUSIP 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     exchange: str | None = Query(None, description="交易所，可选。示例: NASDAQ。"),
     mic_code: str | None = Query(None, description="MIC 代码，可选。示例: XNAS。"),
@@ -98,11 +98,11 @@ async def get_latest_price(
     response_format: str | None = Query(
         None,
         alias="format",
-        description="响应格式，可选 JSON 或 CSV。默认返回 JSON。",
+        description="兼容保留参数。当前接口固定返回 JSON。",
     ),
     prepost: bool | None = Query(
         None,
-        description="是否包含盘前盘后数据，仅部分高级套餐支持。",
+        description="兼容保留参数。当前 FXCM 聚合路径默认不区分盘前盘后。",
     ),
     dp: int | None = Query(
         None, ge=0, le=11, description="价格保留小数位，范围 0 到 11。"
@@ -118,8 +118,8 @@ async def get_latest_price(
     response_model=APIResponse[Any],
     summary="获取实时报价快照",
     description=(
-        "代理 Twelve Data 官方 /quote REST 接口，返回价格、开高低收、成交量和涨跌幅等快照数据。"
-        "免费方案可用，但部分增值字段仍受套餐限制。"
+        "使用 FXCM sidecar 返回兼容报价快照，"
+        "保留价格、开高低收、成交量、涨跌幅等核心字段。"
     ),
     dependencies=[
         Depends(
@@ -139,15 +139,15 @@ async def get_quote(
     ),
     figi: str | None = Query(
         None,
-        description="FIGI 标识，可选。官方文档标注为 Ultra/Enterprise 及以上套餐可用。",
+        description="FIGI 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     isin: str | None = Query(
         None,
-        description="ISIN 标识，可选。官方文档标注为 Data add-ons 能力。",
+        description="ISIN 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     cusip: str | None = Query(
         None,
-        description="CUSIP 标识，可选。官方文档标注为 Data add-ons 能力。",
+        description="CUSIP 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     interval: str | None = Query(
         None,
@@ -171,11 +171,11 @@ async def get_quote(
     response_format: str | None = Query(
         None,
         alias="format",
-        description="响应格式，可选 JSON 或 CSV。默认返回 JSON。",
+        description="兼容保留参数。当前接口固定返回 JSON。",
     ),
     prepost: bool | None = Query(
         None,
-        description="是否包含盘前盘后数据，仅部分高级套餐支持。",
+        description="兼容保留参数。当前 FXCM 聚合路径默认不区分盘前盘后。",
     ),
     eod: bool | None = Query(None, description="是否返回收盘日数据。"),
     rolling_period: int | None = Query(
@@ -202,8 +202,8 @@ async def get_quote(
     response_model=APIResponse[Any],
     summary="获取历史 K 线时序",
     description=(
-        "代理 Twelve Data 官方 /time_series REST 接口。该接口用于获取历史 OHLCV 时序数据，"
-        "免费方案可调用，单次请求的数据点、复权和盘前盘后能力仍以官方套餐权限为准。"
+        "通过 FXCM sidecar 返回兼容的历史 OHLCV 时序数据。"
+        "服务端会补齐 outputsize、周期映射、时区处理与部分聚合逻辑。"
     ),
     dependencies=[
         Depends(
@@ -220,7 +220,7 @@ async def get_time_series(
     interval: str = Query(
         ...,
         description=(
-            "时间粒度，官方当前支持 1min、5min、15min、30min、45min、1h、2h、4h、8h、1day、1week、1month。"
+            "时间粒度。当前兼容层支持 1min、5min、15min、30min、45min、1h、2h、4h、8h、1day、1week、1month。"
         ),
     ),
     symbol: str | None = Query(
@@ -229,21 +229,21 @@ async def get_time_series(
     ),
     figi: str | None = Query(
         None,
-        description="FIGI 标识，可选。官方文档标注为 Ultra/Enterprise 及以上套餐可用。",
+        description="FIGI 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     isin: str | None = Query(
         None,
-        description="ISIN 标识，可选。官方文档标注为 Data add-ons 能力。",
+        description="ISIN 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     cusip: str | None = Query(
         None,
-        description="CUSIP 标识，可选。官方文档标注为 Data add-ons 能力。",
+        description="CUSIP 标识，可选。为兼容旧入参保留；当前 FXCM 接入主要按 symbol 映射。",
     ),
     outputsize: int | None = Query(
         None,
         ge=1,
         le=5000,
-        description="返回数据点数量，官方范围 1 到 5000。",
+        description="返回数据点数量。当前兼容层支持范围 1 到 5000。",
     ),
     exchange: str | None = Query(None, description="交易所，可选。示例: NASDAQ。"),
     mic_code: str | None = Query(None, description="MIC 代码，可选。示例: XNAS。"),
@@ -273,20 +273,20 @@ async def get_time_series(
     ),
     order: str | None = Query(
         None,
-        description="返回排序方向，具体枚举以 Twelve Data 官方文档为准。",
+        description="返回排序方向。当前兼容层常用值为 asc 或 desc。",
     ),
     prepost: bool | None = Query(
         None,
-        description="是否包含盘前盘后数据，仅部分高级套餐支持。",
+        description="兼容保留参数。当前 FXCM 聚合路径默认不区分盘前盘后。",
     ),
     response_format: str | None = Query(
         None,
         alias="format",
-        description="响应格式，可选 JSON 或 CSV。默认返回 JSON。",
+        description="兼容保留参数。当前接口固定返回 JSON。",
     ),
     adjust: str | None = Query(
         None,
-        description="价格复权模式，可选值以 Twelve Data 官方文档为准。",
+        description="兼容保留参数。当前 FXCM 历史接口未使用该参数。",
     ),
     previous_close: bool | None = Query(
         None,
@@ -296,10 +296,10 @@ async def get_time_series(
         None, ge=0, le=11, description="价格保留小数位，范围 0 到 11。"
     ),
     filter_non_trading: bool = Query(
-        True,
+        False,
         description=(
-            "是否过滤明显处于休市状态的平盘 K 线。开启后会剔除周末的静态 K 线，"
-            "以及整天都保持平盘的节假日样式 K 线；如需保留 Twelve Data 原始结果可设为 false。"
+            "是否过滤明显处于休市状态的平盘 K 线。FXCM 默认可直接使用原始时序；"
+            "仅在你确认某些标的存在休市占位 K 线时再设为 true。"
         ),
     ),
 ):
@@ -320,7 +320,8 @@ async def get_time_series(
     response_model=APIResponse[Any],
     summary="搜索交易标的",
     description=(
-        "代理 Twelve Data 官方 /symbol_search REST 接口。适合前端做股票、外汇、ETF、加密货币等交易标的搜索联想。"
+        "使用 FXCM offers 列表并补充手工映射，适合前端做股票、外汇、指数、"
+        "加密货币与贵金属等交易标的搜索联想。"
     ),
     dependencies=[
         Depends(
@@ -337,17 +338,17 @@ async def symbol_search(
     symbol: str = Query(
         ...,
         min_length=1,
-        description="搜索关键字，可传代码、简称，官方也支持部分 ISIN 搜索能力。",
+        description="搜索关键字，可传代码、简称或常见别名。",
     ),
     outputsize: int | None = Query(
         None,
         ge=1,
         le=120,
-        description="最多返回多少条匹配结果，官方上限 120。",
+        description="最多返回多少条匹配结果。当前兼容层上限为 120。",
     ),
     show_plan: bool | None = Query(
         None,
-        description="是否返回标的所属套餐信息，便于前端提示该标的是否受套餐限制。",
+        description="是否返回供应商可用性字段，便于前端提示该标的是否有限制。",
     ),
 ):
     return await _service_response(
@@ -360,8 +361,8 @@ async def symbol_search(
     response_model=APIResponse[Any],
     summary="获取市场异动榜",
     description=(
-        "代理 Twelve Data 官方 /market_movers/{market} REST 接口，返回涨幅榜或跌幅榜。"
-        "官方文档说明该接口支持国际股票、外汇和加密货币市场。"
+        "使用 FXCM sidecar 的市场候选列表与批量 quote 做涨幅榜或跌幅榜聚合。"
+        "FXCM 无覆盖的分类会返回空列表，而不会再回落到 Yahoo。"
     ),
     dependencies=[
         Depends(
@@ -377,17 +378,17 @@ async def get_market_movers(
     request: Request,
     market: str = Path(
         ...,
-        description="市场类型。官方 OpenAPI 当前枚举值为 stocks、etf、mutual_funds、forex、crypto。",
+        description="市场类型。当前兼容层支持 stocks、etf、mutual_funds、forex、crypto。",
     ),
     direction: str | None = Query(
         None,
-        description="榜单方向，可选 gainers 或 losers，实际可用值以官方文档为准。",
+        description="榜单方向。当前兼容层支持 gainers 或 losers。",
     ),
     outputsize: int | None = Query(
         None,
         ge=1,
         le=50,
-        description="榜单返回条数，官方范围 1 到 50。",
+        description="榜单返回条数。当前兼容层支持范围 1 到 50。",
     ),
     country: str | None = Query(
         None,
@@ -411,7 +412,7 @@ async def get_market_movers(
     response_model=APIResponse[Any],
     summary="批量获取自选列表报价",
     description=(
-        "面向前端自选页的聚合接口。传入逗号分隔的 symbols 后，后端会批量调用 Twelve Data /quote，"
+        "面向前端自选页的聚合接口。传入逗号分隔的 symbols 后，后端会通过 FXCM sidecar 的单会话批量 quote 接口，"
         "统一返回归一化后的价格结构，并保留部分失败项。单次最多 10 个代码。"
     ),
     dependencies=[
@@ -450,7 +451,7 @@ async def get_watchlist_quotes(
     eod: bool | None = Query(None, description="是否返回收盘日数据。"),
     prepost: bool | None = Query(
         None,
-        description="是否包含盘前盘后数据，仅部分高级套餐支持。",
+        description="兼容保留参数。当前 FXCM 聚合路径默认不区分盘前盘后。",
     ),
     dp: int | None = Query(
         None, ge=0, le=11, description="价格保留小数位，范围 0 到 11。"
@@ -477,8 +478,8 @@ async def get_watchlist_quotes(
     response_model=APIResponse[Any],
     summary="获取前端友好的 K 线默认结构",
     description=(
-        "对 Twelve Data /time_series 做默认参数封装。默认 outputsize=120、timezone=Exchange、"
-        "order=desc、previous_close=true，并把返回值整理成前端更容易消费的 candles 数组。"
+        "对 FXCM sidecar 历史 K 线接口做前端友好的默认参数封装。默认 outputsize=120、timezone=Exchange、"
+        "order=desc、previous_close=true，默认不过滤休市时段，并补齐 filtering 信息与 candles 数组结构。"
     ),
     dependencies=[
         Depends(
@@ -526,20 +527,20 @@ async def get_kline_defaults(
     ),
     adjust: str | None = Query(
         None,
-        description="价格复权模式，可选值以 Twelve Data 官方文档为准。",
+        description="兼容保留参数。当前 FXCM 历史接口未使用该参数。",
     ),
     prepost: bool | None = Query(
         None,
-        description="是否包含盘前盘后数据，仅部分高级套餐支持。",
+        description="兼容保留参数。当前 FXCM 聚合路径默认不区分盘前盘后。",
     ),
     dp: int | None = Query(
         None, ge=0, le=11, description="价格保留小数位，范围 0 到 11。"
     ),
     filter_non_trading: bool = Query(
-        True,
+        False,
         description=(
-            "是否默认过滤明显处于休市状态的平盘 K 线。默认开启，适合直接给图表渲染；"
-            "如需保留原始时序可设为 false。"
+            "是否过滤明显处于休市状态的平盘 K 线。FXCM 默认可直接给图表渲染；"
+            "仅在你确认某些标的存在休市占位 K 线时再设为 true。"
         ),
     ),
 ):
@@ -568,8 +569,8 @@ async def get_kline_defaults(
     response_model=APIResponse[Any],
     summary="统一市场搜索结构",
     description=(
-        "对 Twelve Data /symbol_search 做前端友好归一化，统一返回 symbol、label、market、"
-        "asset_type、country、currency 等固定字段，便于搜索联想直接渲染。"
+        "对 FXCM offers 搜索结果做前端友好归一化，统一返回 symbol、label、market、"
+        "asset_type、country、currency 等固定字段，并补上关键标的的手工映射。"
     ),
     dependencies=[
         Depends(
@@ -595,7 +596,7 @@ async def get_unified_search(
     ),
     show_plan: bool = Query(
         False,
-        description="是否透出官方套餐字段，便于前端提示标的可用性。",
+        description="是否透出供应商可用性字段，便于前端提示标的可用性。",
     ),
 ):
     return await _service_response(

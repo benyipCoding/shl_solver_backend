@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     twelve_data_api_key: str
     twelve_data_base_url: str
 
+    # FXCM sidecar
+    fxcm_api_base_url: str = "http://127.0.0.1:8100"
+    fxcm_api_timeout_seconds: float = 60.0
+
     # PostHog
     posthog_api_key: str
     posthog_host: str
