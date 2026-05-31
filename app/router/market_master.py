@@ -13,7 +13,7 @@ from app.utils.helpers import ai_rate_limit_key
 router = APIRouter(
     prefix="/market_master",
     tags=["Market Master"],
-    # dependencies=[Depends(verify_user)],
+    # dependencies=[Depends(verify_user)],  暂时注释掉 JWT 验证，后续根据需要开启
 )
 
 
