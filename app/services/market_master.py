@@ -6,7 +6,10 @@ from time import monotonic
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.clients import db as db_client
+from app.models.market_data import MarketInstrument, MarketOHLCVBar
 from app.services.fxcm_sidecar import FXCMSidecarError, fxcm_sidecar_service
+from sqlalchemy import or_, select
 
 
 class TwelveDataAPIError(Exception):
@@ -572,18 +575,48 @@ class MarketMasterService:
         params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         query_params = self._build_query_params(params)
-        requested_interval = self._resolve_interval_name(
-            self._to_str(query_params.get("interval")) or "1day"
+
+        # 使用本地 K 线数据最新的一根作为 quote
+        local_payload = await self._fetch_local_fxcm_time_series_payload(
+            {"symbol": symbol, "interval": "1day", "outputsize": 1}
         )
-        fxcm_symbol = self._resolve_fxcm_symbol(symbol)
-        try:
-            return await fxcm_sidecar_service.get_quote(
-                symbol=fxcm_symbol,
-                interval=requested_interval,
-                price_type="mid",
+        if not local_payload or not local_payload.get("values"):
+            raise TwelveDataAPIError(
+                status_code=404,
+                message=f"No local quote data found for {symbol}",
             )
-        except FXCMSidecarError as exc:
-            raise self._to_twelve_error_from_fxcm(exc) from exc
+
+        latest_bar = local_payload["values"][0]
+        meta = local_payload.get("meta", {})
+
+        return {
+            "symbol": meta.get("symbol", symbol),
+            "name": meta.get("provider_symbol", symbol),
+            "exchange": meta.get("exchange", ""),
+            "mic_code": meta.get("exchange", ""),
+            "currency": meta.get("currency", ""),
+            "datetime": latest_bar["datetime"],
+            "timestamp": latest_bar["timestamp"],
+            "open": str(latest_bar["open"]),
+            "high": str(latest_bar["high"]),
+            "low": str(latest_bar["low"]),
+            "close": str(latest_bar["close"]),
+            "volume": str(latest_bar.get("volume", 0)),
+            "previous_close": str(latest_bar["open"]),
+            "change": "0.00",
+            "percent_change": "0.00",
+            "average_volume": "0",
+            "is_market_open": False,
+            "fifty_two_week": {
+                "low": str(latest_bar["low"]),
+                "high": str(latest_bar["high"]),
+                "low_change": "0.00",
+                "high_change": "0.00",
+                "low_change_percent": "0.00",
+                "high_change_percent": "0.00",
+                "range": f"{latest_bar['low']} - {latest_bar['high']}",
+            },
+        }
 
     async def _fetch_search_items(
         self,
@@ -591,16 +624,42 @@ class MarketMasterService:
         outputsize: int,
     ) -> list[dict[str, Any]]:
         alias_items = self._search_alias_items(keyword)
+        clean_keyword = keyword.strip()
+        search_limit = min(120, max(outputsize * 4, outputsize))
 
-        try:
-            payload = await fxcm_sidecar_service.search_symbols(
-                keyword=keyword,
-                outputsize=min(120, max(outputsize * 4, outputsize)),
+        fxcm_items = []
+        async with db_client.async_session() as db:
+            stmt = (
+                select(MarketInstrument)
+                .where(
+                    MarketInstrument.provider == "FXCM",
+                    MarketInstrument.is_searchable.is_(True),
+                    MarketInstrument.is_active.is_(True),
+                    or_(
+                        MarketInstrument.symbol.ilike(f"%{clean_keyword}%"),
+                        MarketInstrument.name.ilike(f"%{clean_keyword}%"),
+                        MarketInstrument.provider_symbol.ilike(f"%{clean_keyword}%"),
+                    ),
+                )
+                .order_by(MarketInstrument.sort_weight.asc())
+                .limit(search_limit)
             )
-        except FXCMSidecarError as exc:
-            raise self._to_twelve_error_from_fxcm(exc) from exc
 
-        fxcm_items = payload.get("items") if isinstance(payload, Mapping) else []
+            instruments = (await db.execute(stmt)).scalars().all()
+            for inst in instruments:
+                fxcm_items.append(
+                    {
+                        "symbol": inst.symbol,
+                        "instrument_name": inst.name,
+                        "exchange": inst.exchange,
+                        "mic_code": inst.mic_code,
+                        "exchange_timezone": inst.exchange_timezone,
+                        "instrument_type": inst.asset_type,
+                        "country": inst.country,
+                        "currency": inst.currency,
+                    }
+                )
+
         normalized_items = [
             self._overlay_search_profile(item)
             for item in fxcm_items
@@ -615,10 +674,49 @@ class MarketMasterService:
         self,
         query_params: Mapping[str, Any],
     ) -> dict[str, Any]:
+        local_payload = await self._fetch_local_fxcm_time_series_payload(query_params)
+        if local_payload is not None:
+            return local_payload
+
+        # 如果本地没有数据，执行按需懒加载采集，并注册给后台进程
         symbol = self._resolve_fxcm_symbol(self._extract_identifier(query_params))
         requested_interval = self._resolve_interval_name(
             self._to_str(query_params.get("interval")) or "1day"
         )
+        outputsize = self._to_int(query_params.get("outputsize"))
+
+        from app.clients import db as db_client
+        from app.services.fxcm_market_sync import fxcm_market_sync_service
+
+        async with db_client.async_session() as db:
+            success = await fxcm_market_sync_service.fetch_on_demand_and_register(
+                db, symbol, requested_interval, outputsize
+            )
+
+        if success:
+            local_payload = await self._fetch_local_fxcm_time_series_payload(
+                query_params
+            )
+            if local_payload is not None:
+                return local_payload
+
+        raise TwelveDataAPIError(
+            status_code=404,
+            message=f"No local history data found for {symbol} ({requested_interval}), and on-demand fetch failed.",
+        )
+
+    async def _fetch_local_fxcm_time_series_payload(
+        self,
+        query_params: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        requested_interval = self._resolve_interval_name(
+            self._to_str(query_params.get("interval")) or "1day"
+        )
+        if requested_interval not in {"30min", "1h", "2h", "4h", "1day"}:
+            return None
+
+        symbol = self._resolve_fxcm_symbol(self._extract_identifier(query_params))
+        normalized_symbol = self._normalize_lookup(symbol)
         outputsize = self._bounded_int(
             query_params.get("outputsize"),
             default=self.DEFAULT_TIME_SERIES_OUTPUTSIZE,
@@ -626,19 +724,69 @@ class MarketMasterService:
             maximum=5000,
         )
         history_params = self._build_fxcm_history_params(query_params)
+        start_dt = self._parse_request_datetime(history_params.get("start_date"))
+        end_dt = self._parse_request_datetime(history_params.get("end_date"))
 
-        try:
-            payload = await fxcm_sidecar_service.get_history(
-                symbol=symbol,
-                interval=requested_interval,
-                outputsize=outputsize,
-                start_date=history_params.get("start_date"),
-                end_date=history_params.get("end_date"),
-                price_type="mid",
+        async with db_client.async_session() as db:
+            instrument_stmt = select(MarketInstrument).where(
+                MarketInstrument.provider == "FXCM",
+                MarketInstrument.supports_history.is_(True),
+                or_(
+                    MarketInstrument.normalized_symbol == normalized_symbol,
+                    MarketInstrument.normalized_provider_symbol == normalized_symbol,
+                ),
             )
-        except FXCMSidecarError as exc:
-            raise self._to_twelve_error_from_fxcm(exc) from exc
+            instrument = (await db.execute(instrument_stmt)).scalars().first()
+            if instrument is None:
+                return None
 
+            bar_stmt = select(MarketOHLCVBar).where(
+                MarketOHLCVBar.instrument_id == instrument.id,
+                MarketOHLCVBar.interval == requested_interval,
+                MarketOHLCVBar.price_type == "mid",
+            )
+            if start_dt is not None:
+                bar_stmt = bar_stmt.where(MarketOHLCVBar.bar_time >= start_dt)
+            if end_dt is not None:
+                bar_stmt = bar_stmt.where(MarketOHLCVBar.bar_time < end_dt)
+
+            bar_stmt = bar_stmt.order_by(MarketOHLCVBar.bar_time.desc()).limit(
+                outputsize + 1
+            )
+            bars = list((await db.execute(bar_stmt)).scalars().all())
+            if not bars:
+                return None
+
+        values = [
+            {
+                "datetime": bar.bar_time.astimezone(timezone.utc).isoformat(),
+                "timestamp": int(bar.bar_time.timestamp()),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": bar.volume,
+            }
+            for bar in reversed(bars)
+        ]
+
+        payload = {
+            "meta": {
+                "symbol": instrument.symbol,
+                "provider_symbol": instrument.provider_symbol,
+                "requested_interval": requested_interval,
+                "provider_interval": requested_interval,
+                "price_type": "mid",
+                "count": len(values),
+                "currency": instrument.currency,
+                "exchange": instrument.exchange,
+                "exchange_timezone": instrument.exchange_timezone,
+                "asset_type": instrument.asset_type,
+                "start_date": history_params.get("start_date"),
+                "end_date": history_params.get("end_date"),
+            },
+            "values": values,
+        }
         return self._build_time_series_payload_from_fxcm(payload, query_params)
 
     async def _get_time_series_payload(
@@ -936,13 +1084,20 @@ class MarketMasterService:
 
     def _resolve_interval_name(self, interval: str) -> str:
         aliases = {
+            "m30": "30min",
+            "30m": "30min",
+            "30min": "30min",
+            "h1": "1h",
+            "h2": "2h",
+            "h4": "4h",
             "1d": "1day",
             "1wk": "1week",
             "1mo": "1month",
             "60m": "1h",
             "60min": "1h",
         }
-        return aliases.get(interval, interval)
+        normalized_interval = interval.casefold()
+        return aliases.get(normalized_interval, normalized_interval)
 
     def _build_symbol_search_record(
         self,

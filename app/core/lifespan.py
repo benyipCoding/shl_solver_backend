@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.clients.db import init_db, close_db
 from app.clients.redis_client import init_redis, close_redis
 from app.clients.openrouter import init_openrouter_client
+from app.services.fxcm_market_sync import fxcm_market_sync_scheduler
 
 
 @asynccontextmanager
@@ -32,7 +33,23 @@ async def lifespan(app: FastAPI):
         except Exception:
             print("⚠️ Redis init failed, continuing startup")
 
+    if settings.fxcm_sync_enabled and settings.is_local_development:
+        try:
+            await fxcm_market_sync_scheduler.start()
+            print("✅ FXCM market sync scheduler started")
+        except Exception:
+            print("⚠️ FXCM market sync scheduler failed to start, continuing startup")
+    elif settings.fxcm_sync_enabled:
+        print("ℹ️ FXCM market sync scheduler skipped outside local development")
+
     yield
+
+    if settings.fxcm_sync_enabled and settings.is_local_development:
+        try:
+            await fxcm_market_sync_scheduler.stop()
+            print("🛑 FXCM market sync scheduler stopped")
+        except Exception:
+            pass
 
     # ===== shutdown =====
     # 关闭数据库连接

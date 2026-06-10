@@ -2,12 +2,10 @@ from typing import Any, Awaitable
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
-from fastapi_limiter.depends import RateLimiter
 
 from app.depends.jwt_guard import verify_user
 from app.schemas.response import APIResponse
 from app.services.market_master import TwelveDataAPIError, market_master_service
-from app.utils.helpers import ai_rate_limit_key
 
 
 router = APIRouter(
@@ -17,14 +15,6 @@ router = APIRouter(
 )
 
 
-PRICE_LIMIT_PER_MINUTE = 8
-QUOTE_LIMIT_PER_MINUTE = 6
-TIME_SERIES_LIMIT_PER_MINUTE = 4
-SYMBOL_SEARCH_LIMIT_PER_MINUTE = 10
-MARKET_MOVERS_LIMIT_PER_MINUTE = 6
-WATCHLIST_QUOTES_LIMIT_PER_MINUTE = 2
-KLINE_DEFAULTS_LIMIT_PER_MINUTE = 6
-UNIFIED_SEARCH_LIMIT_PER_MINUTE = 10
 
 
 def _request_params(request: Request) -> dict[str, Any]:
@@ -57,15 +47,6 @@ async def _service_response(
         "使用 FXCM sidecar 返回最新价格。当前以 symbol 为主键做映射；"
         "对外保留兼容路径，便于前端无感切换。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=PRICE_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_latest_price(
     request: Request,
@@ -121,15 +102,6 @@ async def get_latest_price(
         "使用 FXCM sidecar 返回兼容报价快照，"
         "保留价格、开高低收、成交量、涨跌幅等核心字段。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=QUOTE_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_quote(
     request: Request,
@@ -205,15 +177,6 @@ async def get_quote(
         "通过 FXCM sidecar 返回兼容的历史 OHLCV 时序数据。"
         "服务端会补齐 outputsize、周期映射、时区处理与部分聚合逻辑。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=TIME_SERIES_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_time_series(
     request: Request,
@@ -323,15 +286,6 @@ async def get_time_series(
         "使用 FXCM offers 列表并补充手工映射，适合前端做股票、外汇、指数、"
         "加密货币与贵金属等交易标的搜索联想。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=SYMBOL_SEARCH_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def symbol_search(
     request: Request,
@@ -364,15 +318,6 @@ async def symbol_search(
         "使用 FXCM sidecar 的市场候选列表与批量 quote 做涨幅榜或跌幅榜聚合。"
         "FXCM 无覆盖的分类会返回空列表，而不会再回落到 Yahoo。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=MARKET_MOVERS_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_market_movers(
     request: Request,
@@ -415,15 +360,6 @@ async def get_market_movers(
         "面向前端自选页的聚合接口。传入逗号分隔的 symbols 后，后端会通过 FXCM sidecar 的单会话批量 quote 接口，"
         "统一返回归一化后的价格结构，并保留部分失败项。单次最多 10 个代码。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=WATCHLIST_QUOTES_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_watchlist_quotes(
     symbols: str = Query(
@@ -481,15 +417,6 @@ async def get_watchlist_quotes(
         "对 FXCM sidecar 历史 K 线接口做前端友好的默认参数封装。默认 outputsize=120、timezone=Exchange、"
         "order=desc、previous_close=true，默认不过滤休市时段，并补齐 filtering 信息与 candles 数组结构。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=KLINE_DEFAULTS_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_kline_defaults(
     symbol: str = Query(..., description="标的代码。示例: AAPL、EUR/USD、BTC/USD。"),
@@ -572,15 +499,6 @@ async def get_kline_defaults(
         "对 FXCM offers 搜索结果做前端友好归一化，统一返回 symbol、label、market、"
         "asset_type、country、currency 等固定字段，并补上关键标的的手工映射。"
     ),
-    dependencies=[
-        Depends(
-            RateLimiter(
-                times=UNIFIED_SEARCH_LIMIT_PER_MINUTE,
-                seconds=60,
-                identifier=ai_rate_limit_key,
-            )
-        )
-    ],
 )
 async def get_unified_search(
     keyword: str = Query(

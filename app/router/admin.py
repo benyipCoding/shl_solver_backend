@@ -11,6 +11,8 @@ from app.models.user import CreditType, User
 from app.schemas.admin import (
     AdminCreditLogItem,
     AdminCreditLogListResponse,
+    AdminFXCMMarketSyncStatusResponse,
+    AdminFXCMMarketSyncTriggerResponse,
     AdminTokenRecordItem,
     AdminTokenRecordListResponse,
     AdminUserDetail,
@@ -23,6 +25,10 @@ from app.schemas.admin import (
 )
 from app.schemas.response import APIResponse
 from app.services.admin import admin_service
+from app.services.fxcm_market_sync import (
+    fxcm_market_sync_scheduler,
+    fxcm_market_sync_service,
+)
 
 
 router = APIRouter(
@@ -236,3 +242,45 @@ async def get_admin_token_record_detail(
 ):
     data = await admin_service.get_token_record_detail(db=db, record_id=record_id)
     return APIResponse(data=data)
+
+
+@router.get(
+    "/market-data/status",
+    response_model=APIResponse[AdminFXCMMarketSyncStatusResponse],
+    summary="查看 FXCM 市场数据同步状态",
+    description="返回本地 FXCM 品种、别名、K 线和同步状态数量，以及当前调度配置。",
+)
+async def get_market_data_sync_status(
+    db: AsyncSession = Depends(get_db),
+):
+    payload = await fxcm_market_sync_service.get_status(db)
+    payload["scheduler_running"] = fxcm_market_sync_scheduler.is_running()
+    return APIResponse(data=AdminFXCMMarketSyncStatusResponse.model_validate(payload))
+
+
+@router.post(
+    "/market-data/sync",
+    response_model=APIResponse[AdminFXCMMarketSyncTriggerResponse],
+    summary="手动触发 FXCM 市场数据同步",
+    description="mode 支持 all、metadata、bars；bars 默认会强制忽略 next_sync_from。",
+)
+async def trigger_market_data_sync(
+    mode: str = Query(
+        "all",
+        pattern="^(all|metadata|bars)$",
+        description="同步模式：all、metadata、bars",
+    ),
+    force_due: bool = Query(
+        True,
+        description="仅对 bars 或 all 有效，是否忽略 next_sync_from 直接执行到期状态。",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await fxcm_market_sync_service.run_manual(
+        db,
+        mode=mode,
+        force_due=force_due,
+    )
+    return APIResponse(
+        data=AdminFXCMMarketSyncTriggerResponse.model_validate(result.to_dict())
+    )

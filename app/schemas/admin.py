@@ -127,3 +127,34 @@ class AdminTokenRecordItem(BaseModel):
 class AdminTokenRecordListResponse(BaseModel):
     items: List[AdminTokenRecordItem]
     pagination: PaginationMeta
+
+
+class AdminFXCMMarketSyncTriggerResponse(BaseModel):
+    reason: str
+    skipped: bool
+    metadata_synced: bool
+    synced_instruments: int
+    bootstrap_states: int
+    processed_states: int
+    succeeded_states: int
+    failed_states: int
+    rows_upserted: int
+    errors: List[str]
+    finished_at: Optional[datetime] = None
+
+
+class AdminFXCMMarketSyncStatusResponse(BaseModel):
+    scheduler_enabled: bool
+    scheduler_running: bool
+    lock_held: bool
+    hot_symbols: List[str]
+    metadata_interval_hours: int
+    bar_intervals: List[str]
+    instrument_count: int
+    alias_count: int
+    bar_count: int
+    state_count: int
+    enabled_state_count: int
+    due_state_count: int
+    failed_state_count: int
+    last_metadata_sync_at: Optional[datetime] = None
