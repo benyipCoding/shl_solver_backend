@@ -712,8 +712,6 @@ class MarketMasterService:
         requested_interval = self._resolve_interval_name(
             self._to_str(query_params.get("interval")) or "1day"
         )
-        if requested_interval not in {"30min", "1h", "2h", "4h", "1day"}:
-            return None
 
         symbol = self._resolve_fxcm_symbol(self._extract_identifier(query_params))
         normalized_symbol = self._normalize_lookup(symbol)

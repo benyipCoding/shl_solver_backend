@@ -679,49 +679,120 @@ class FXCMMarketSyncService:
         state.last_status = "RUNNING"
         state.last_error = None
 
-        request_payload = self._build_history_request_payload(state, instrument)
-        payload = await fxcm_sidecar_service.get_history(**request_payload)
-        values = payload.get("values") if isinstance(payload, Mapping) else []
-        rows = self._build_bar_rows(
-            instrument=instrument,
-            state=state,
-            values=values if isinstance(values, list) else [],
-            meta=payload.get("meta") if isinstance(payload, Mapping) else None,
-        )
-
         inserted_count = 0
-        if rows:
-            inserted_count = await self._upsert_bars(db, rows)
-            bar_times = [row["bar_time"] for row in rows]
-            earliest_time = min(bar_times)
-            latest_time = max(bar_times)
-            state.earliest_synced_bar_time = self._min_datetime(
-                state.earliest_synced_bar_time,
-                earliest_time,
+
+        if state.backfill_completed:
+            # 增量更新逻辑
+            request_payload = self._build_history_request_payload(state, instrument)
+            payload = await fxcm_sidecar_service.get_history(**request_payload)
+            values = payload.get("values") if isinstance(payload, Mapping) else []
+            rows = self._build_bar_rows(
+                instrument=instrument,
+                state=state,
+                values=values if isinstance(values, list) else [],
+                meta=payload.get("meta") if isinstance(payload, Mapping) else None,
             )
-            state.latest_synced_bar_time = self._max_datetime(
-                state.latest_synced_bar_time,
-                latest_time,
+
+            if rows:
+                inserted_count = await self._upsert_bars(db, rows)
+                bar_times = [row["bar_time"] for row in rows]
+                earliest_time = min(bar_times)
+                latest_time = max(bar_times)
+                state.earliest_synced_bar_time = self._min_datetime(
+                    state.earliest_synced_bar_time, earliest_time
+                )
+                state.latest_synced_bar_time = self._max_datetime(
+                    state.latest_synced_bar_time, latest_time
+                )
+                state.last_success_at = _utc_now()
+                state.last_status = "SUCCESS"
+                state.retry_count = 0
+            else:
+                state.last_status = "EMPTY"
+                state.retry_count = 0
+
+            state.last_requested_start_at = self._parse_request_payload_datetime(
+                request_payload.get("start_date")
             )
+            state.last_requested_end_at = self._parse_request_payload_datetime(
+                request_payload.get("end_date")
+            )
+
+        else:
+            # === Backfill Paginator (历史回补：向前翻页拉取，至少拉取 10,000 条或直到无数据) ===
+            target_history_bars = max(10000, int(state.target_history_bars or 10000))
+            batch_size = 2000
+            total_fetched = 0
+
+            # 使用已知的最早 K 线时间做 end_date 起点；如果是全新采集则为 None，优先拉最新的一批
+            current_end_date = (
+                state.earliest_synced_bar_time.isoformat()
+                if state.earliest_synced_bar_time
+                else None
+            )
+
+            while total_fetched < target_history_bars:
+                request_payload = {
+                    "symbol": instrument.provider_symbol,
+                    "interval": state.interval,
+                    "outputsize": min(batch_size, target_history_bars - total_fetched),
+                    "start_date": None,
+                    "end_date": current_end_date,
+                    "price_type": state.price_type,
+                }
+
+                payload = await fxcm_sidecar_service.get_history(**request_payload)
+                values = payload.get("values") if isinstance(payload, Mapping) else []
+
+                if not values:
+                    break
+
+                rows = self._build_bar_rows(
+                    instrument=instrument,
+                    state=state,
+                    values=values if isinstance(values, list) else [],
+                    meta=payload.get("meta") if isinstance(payload, Mapping) else None,
+                )
+
+                if not rows:
+                    break
+
+                inserted = await self._upsert_bars(db, rows)
+                inserted_count += inserted
+                total_fetched += len(rows)
+
+                bar_times = [row["bar_time"] for row in rows]
+                batch_earliest = min(bar_times)
+                batch_latest = max(bar_times)
+
+                state.earliest_synced_bar_time = self._min_datetime(
+                    state.earliest_synced_bar_time, batch_earliest
+                )
+                state.latest_synced_bar_time = self._max_datetime(
+                    state.latest_synced_bar_time, batch_latest
+                )
+
+                # 将下一页拉取的 end_date 设为当前批次获取到的最早时间
+                current_end_date = batch_earliest.isoformat()
+
+                if len(rows) < batch_size * 0.9:
+                    # 如果返回的条数少于设定的批次大小(留点容错边界)，说明已经抵达 FXCM 那边最早的一根 K 线，没必要再往前翻页了
+                    break
+
+                # 等待 0.5 秒避免密集翻页触发第三方 API 的限流
+                await asyncio.sleep(0.5)
+
             state.last_success_at = _utc_now()
             state.last_status = "SUCCESS"
             state.retry_count = 0
-            if not state.backfill_completed:
-                state.backfill_completed = True
-                state.sync_mode = "INCREMENTAL"
-        else:
-            state.last_status = "EMPTY"
-            state.retry_count = 0
-            if not state.backfill_completed:
-                state.backfill_completed = True
-                state.sync_mode = "INCREMENTAL"
+            state.backfill_completed = True
+            state.sync_mode = "INCREMENTAL"
 
-        state.last_requested_start_at = self._parse_request_payload_datetime(
-            request_payload.get("start_date")
-        )
-        state.last_requested_end_at = self._parse_request_payload_datetime(
-            request_payload.get("end_date")
-        )
+            state.last_requested_start_at = self._parse_request_payload_datetime(
+                current_end_date
+            )
+            state.last_requested_end_at = None
+
         state.next_sync_from = self._calculate_next_sync_from(
             interval=state.interval,
             now=_utc_now(),
@@ -937,14 +1008,16 @@ class FXCMMarketSyncService:
         return _utc_now() >= due_at
 
     def _incremental_outputsize(self, interval: str) -> int:
-        if interval == "1day":
+        if interval in {"1month", "1week", "1day"}:
             return settings.fxcm_sync_1day_incremental_outputsize
-        if interval == "4h":
+        if interval in {"8h", "4h"}:
             return max(60, settings.fxcm_sync_1h_incremental_outputsize // 2)
         if interval == "2h":
             return max(100, settings.fxcm_sync_1h_incremental_outputsize)
-        if interval == "30min":
+        if interval in {"1h", "45min", "30min"}:
             return max(300, settings.fxcm_sync_1h_incremental_outputsize * 2)
+        if interval in {"15min", "5min", "1min"}:
+            return max(500, settings.fxcm_sync_1h_incremental_outputsize * 3)
         return settings.fxcm_sync_1h_incremental_outputsize
 
     def _state_priority(self, interval: str) -> int:
@@ -954,14 +1027,30 @@ class FXCMMarketSyncService:
             return 100
 
     def _interval_delta(self, interval: str) -> timedelta:
+        if interval == "1month":
+            return timedelta(days=30)
+        if interval == "1week":
+            return timedelta(weeks=1)
         if interval == "1day":
             return timedelta(days=1)
+        if interval == "8h":
+            return timedelta(hours=8)
         if interval == "4h":
             return timedelta(hours=4)
         if interval == "2h":
             return timedelta(hours=2)
+        if interval == "1h":
+            return timedelta(hours=1)
+        if interval == "45min":
+            return timedelta(minutes=45)
         if interval == "30min":
             return timedelta(minutes=30)
+        if interval == "15min":
+            return timedelta(minutes=15)
+        if interval == "5min":
+            return timedelta(minutes=5)
+        if interval == "1min":
+            return timedelta(minutes=1)
         return timedelta(hours=1)
 
     def _weekend_resume_at(
