@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    app_env: str = "local"
+    app_env: str = "prod"
 
     api_key: str
     or_api_key: str
@@ -86,6 +86,8 @@ class Settings(BaseSettings):
         normalized_env = self.app_env.strip().casefold()
         if normalized_env in {"local", "dev", "development"}:
             return True
+        if normalized_env in {"production", "prod", "staging"}:
+            return False
 
         fxcm_host = (urlparse(self.fxcm_api_base_url).hostname or "").casefold()
         frontend_host = (urlparse(self.frontend_base_url).hostname or "").casefold()
