@@ -68,16 +68,17 @@ class FXCMMarketSyncService:
         self._lock = asyncio.Lock()
         self._last_metadata_sync_at: datetime | None = None
 
-    @property
-    def hot_symbols(self) -> list[str]:
-        raw_symbols = [
-            item.strip()
-            for item in settings.fxcm_sync_hot_symbols.split(",")
-            if item.strip()
-        ]
+    async def get_hot_symbols(self, db: AsyncSession) -> list[str]:
+        stmt = select(MarketInstrument.symbol).where(
+            MarketInstrument.provider == self.PROVIDER,
+            MarketInstrument.is_active.is_(True),
+            MarketInstrument.is_hot.is_(True),
+        )
+        symbols = (await db.execute(stmt)).scalars().all()
+
         canonical_symbols: list[str] = []
         seen: set[str] = set()
-        for symbol in raw_symbols:
+        for symbol in symbols:
             canonical_symbol = market_master_service._resolve_fxcm_symbol(symbol)
             if canonical_symbol in seen:
                 continue
@@ -225,7 +226,9 @@ class FXCMMarketSyncService:
         instrument = (await db.execute(stmt)).scalars().first()
 
         if instrument is None:
-            instrument_payload = await self._build_instrument_payload(canonical_symbol)
+            instrument_payload = await self._build_instrument_payload(
+                canonical_symbol, hot_symbols=None
+            )
             if instrument_payload is None:
                 return False
             instrument = await self._upsert_instrument(db, instrument_payload)
@@ -282,8 +285,11 @@ class FXCMMarketSyncService:
 
     async def sync_instruments(self, db: AsyncSession) -> int:
         synced_count = 0
-        for symbol in self.hot_symbols:
-            instrument_payload = await self._build_instrument_payload(symbol)
+        hot_symbols = await self.get_hot_symbols(db)
+        for symbol in hot_symbols:
+            instrument_payload = await self._build_instrument_payload(
+                symbol, hot_symbols=hot_symbols
+            )
             if instrument_payload is None:
                 continue
 
@@ -299,10 +305,8 @@ class FXCMMarketSyncService:
     async def bootstrap_sync_states(self, db: AsyncSession) -> int:
         stmt = select(MarketInstrument).where(
             MarketInstrument.provider == self.PROVIDER,
-            MarketInstrument.normalized_symbol.in_(
-                [self._normalize_symbol(symbol) for symbol in self.hot_symbols]
-            ),
             MarketInstrument.is_active.is_(True),
+            MarketInstrument.is_hot.is_(True),
         )
         instruments = (await db.execute(stmt)).scalars().all()
 
@@ -363,10 +367,10 @@ class FXCMMarketSyncService:
                 MarketInstrument.is_active.is_(True),
             )
             .order_by(
-                MarketBarSyncState.priority.asc(),
                 MarketBarSyncState.last_attempt_at.asc().nullsfirst(),
+                MarketBarSyncState.priority.asc(),
             )
-            .limit(settings.fxcm_sync_batch_size)
+            .limit(1)
         )
         if not force_due:
             stmt = stmt.where(
@@ -470,11 +474,13 @@ class FXCMMarketSyncService:
             )
         )
 
+        hot_symbols = await self.get_hot_symbols(db)
+
         return {
             "scheduler_enabled": settings.fxcm_sync_enabled,
             "scheduler_running": False,
             "lock_held": self.is_running(),
-            "hot_symbols": self.hot_symbols,
+            "hot_symbols": hot_symbols,
             "metadata_interval_hours": settings.fxcm_sync_metadata_interval_hours,
             "bar_intervals": self.sync_intervals,
             "instrument_count": int(instrument_count or 0),
@@ -487,7 +493,9 @@ class FXCMMarketSyncService:
             "last_metadata_sync_at": self._last_metadata_sync_at,
         }
 
-    async def _build_instrument_payload(self, symbol: str) -> dict[str, Any] | None:
+    async def _build_instrument_payload(
+        self, symbol: str, hot_symbols: list[str] | None = None
+    ) -> dict[str, Any] | None:
         canonical_symbol = market_master_service._resolve_fxcm_symbol(symbol)
         profile = market_master_service._find_symbol_profile(canonical_symbol)
 
@@ -592,7 +600,7 @@ class FXCMMarketSyncService:
             "provider_plan": self._coalesce_str(
                 search_item.get("provider_plan") if search_item else None,
             ),
-            "sort_weight": self._sort_weight(symbol_value),
+            "sort_weight": self._sort_weight(symbol_value, hot_symbols=hot_symbols),
             "is_active": True,
             "is_searchable": True,
             "is_hot": True,
@@ -681,117 +689,94 @@ class FXCMMarketSyncService:
 
         inserted_count = 0
 
-        if state.backfill_completed:
-            # 增量更新逻辑
-            request_payload = self._build_history_request_payload(state, instrument)
-            payload = await fxcm_sidecar_service.get_history(**request_payload)
-            values = payload.get("values") if isinstance(payload, Mapping) else []
-            rows = self._build_bar_rows(
-                instrument=instrument,
-                state=state,
-                values=values if isinstance(values, list) else [],
-                meta=payload.get("meta") if isinstance(payload, Mapping) else None,
+        # --- 第一阶段（前向/增量）：始终拉取最新数据，保持与实时行情同步 ---
+        forward_payload = {
+            "symbol": instrument.provider_symbol,
+            "interval": state.interval,
+            "outputsize": self._incremental_outputsize(state.interval),
+            "start_date": None,
+            "end_date": None,
+            "price_type": state.price_type,
+        }
+
+        if state.latest_synced_bar_time is not None:
+            # 与已有最新数据做部分重叠，避免漏掉跳动的数据
+            overlap = self._interval_delta(state.interval) * max(
+                1, settings.fxcm_sync_incremental_overlap_bars
+            )
+            incremental_start = state.latest_synced_bar_time - overlap
+            forward_payload["start_date"] = incremental_start.isoformat()
+
+        payload = await fxcm_sidecar_service.get_history(**forward_payload)
+        values = payload.get("values") if isinstance(payload, Mapping) else []
+        rows = self._build_bar_rows(
+            instrument=instrument,
+            state=state,
+            values=values if isinstance(values, list) else [],
+            meta=payload.get("meta") if isinstance(payload, Mapping) else None,
+        )
+
+        if rows:
+            inserted = await self._upsert_bars(db, rows)
+            inserted_count += inserted
+            bar_times = [row["bar_time"] for row in rows]
+
+            state.earliest_synced_bar_time = self._min_datetime(
+                state.earliest_synced_bar_time, min(bar_times)
+            )
+            state.latest_synced_bar_time = self._max_datetime(
+                state.latest_synced_bar_time, max(bar_times)
             )
 
-            if rows:
-                inserted_count = await self._upsert_bars(db, rows)
-                bar_times = [row["bar_time"] for row in rows]
-                earliest_time = min(bar_times)
-                latest_time = max(bar_times)
-                state.earliest_synced_bar_time = self._min_datetime(
-                    state.earliest_synced_bar_time, earliest_time
-                )
-                state.latest_synced_bar_time = self._max_datetime(
-                    state.latest_synced_bar_time, latest_time
-                )
-                state.last_success_at = _utc_now()
-                state.last_status = "SUCCESS"
-                state.retry_count = 0
-            else:
-                state.last_status = "EMPTY"
-                state.retry_count = 0
-
             state.last_requested_start_at = self._parse_request_payload_datetime(
-                request_payload.get("start_date")
+                forward_payload.get("start_date")
             )
             state.last_requested_end_at = self._parse_request_payload_datetime(
-                request_payload.get("end_date")
+                forward_payload.get("end_date")
             )
 
-        else:
-            # === Backfill Paginator (历史回补：向前翻页拉取，至少拉取 10,000 条或直到无数据) ===
-            target_history_bars = max(10000, int(state.target_history_bars or 10000))
-            batch_size = 2000
-            total_fetched = 0
+        # --- 第二阶段（后向/回补）：用时间换空间，每次往后推进一小批，直至数据枯竭 ---
+        if state.earliest_synced_bar_time is not None and not state.backfill_completed:
+            batch_size = 1000  # 每次仅抓取一小批，不阻塞长连接
+            backfill_payload = {
+                "symbol": instrument.provider_symbol,
+                "interval": state.interval,
+                "outputsize": batch_size,
+                "start_date": None,
+                "end_date": state.earliest_synced_bar_time.isoformat(),
+                "price_type": state.price_type,
+            }
 
-            # 使用已知的最早 K 线时间做 end_date 起点；如果是全新采集则为 None，优先拉最新的一批
-            current_end_date = (
-                state.earliest_synced_bar_time.isoformat()
-                if state.earliest_synced_bar_time
-                else None
+            b_payload = await fxcm_sidecar_service.get_history(**backfill_payload)
+            b_values = b_payload.get("values") if isinstance(b_payload, Mapping) else []
+            b_rows = self._build_bar_rows(
+                instrument=instrument,
+                state=state,
+                values=b_values if isinstance(b_values, list) else [],
+                meta=b_payload.get("meta") if isinstance(b_payload, Mapping) else None,
             )
 
-            while total_fetched < target_history_bars:
-                request_payload = {
-                    "symbol": instrument.provider_symbol,
-                    "interval": state.interval,
-                    "outputsize": min(batch_size, target_history_bars - total_fetched),
-                    "start_date": None,
-                    "end_date": current_end_date,
-                    "price_type": state.price_type,
-                }
-
-                payload = await fxcm_sidecar_service.get_history(**request_payload)
-                values = payload.get("values") if isinstance(payload, Mapping) else []
-
-                if not values:
-                    break
-
-                rows = self._build_bar_rows(
-                    instrument=instrument,
-                    state=state,
-                    values=values if isinstance(values, list) else [],
-                    meta=payload.get("meta") if isinstance(payload, Mapping) else None,
-                )
-
-                if not rows:
-                    break
-
-                inserted = await self._upsert_bars(db, rows)
+            if b_rows:
+                inserted = await self._upsert_bars(db, b_rows)
                 inserted_count += inserted
-                total_fetched += len(rows)
+                b_bar_times = [row["bar_time"] for row in b_rows]
+                new_earliest = min(b_bar_times)
 
-                bar_times = [row["bar_time"] for row in rows]
-                batch_earliest = min(bar_times)
-                batch_latest = max(bar_times)
+                # 若抓到的最老数据没有更早，或是量极少，说明源头已无更多历史
+                if new_earliest >= state.earliest_synced_bar_time:
+                    state.backfill_completed = True
+                else:
+                    state.earliest_synced_bar_time = new_earliest
 
-                state.earliest_synced_bar_time = self._min_datetime(
-                    state.earliest_synced_bar_time, batch_earliest
-                )
-                state.latest_synced_bar_time = self._max_datetime(
-                    state.latest_synced_bar_time, batch_latest
-                )
+                if len(b_rows) < batch_size * 0.9:
+                    state.backfill_completed = True
+            else:
+                state.backfill_completed = True
 
-                # 将下一页拉取的 end_date 设为当前批次获取到的最早时间
-                current_end_date = batch_earliest.isoformat()
-
-                if len(rows) < batch_size * 0.9:
-                    # 如果返回的条数少于设定的批次大小(留点容错边界)，说明已经抵达 FXCM 那边最早的一根 K 线，没必要再往前翻页了
-                    break
-
-                # 等待 0.5 秒避免密集翻页触发第三方 API 的限流
-                await asyncio.sleep(0.5)
-
-            state.last_success_at = _utc_now()
-            state.last_status = "SUCCESS"
-            state.retry_count = 0
-            state.backfill_completed = True
-            state.sync_mode = "INCREMENTAL"
-
-            state.last_requested_start_at = self._parse_request_payload_datetime(
-                current_end_date
-            )
-            state.last_requested_end_at = None
+        state.last_success_at = _utc_now()
+        state.last_status = "SUCCESS"
+        state.retry_count = 0
+        state.sync_mode = "INCREMENTAL" if state.backfill_completed else "BACKFILL"
 
         state.next_sync_from = self._calculate_next_sync_from(
             interval=state.interval,
@@ -801,32 +786,6 @@ class FXCMMarketSyncService:
         )
         state.updated_at = _utc_now()
         return inserted_count
-
-    def _build_history_request_payload(
-        self,
-        state: MarketBarSyncState,
-        instrument: MarketInstrument,
-    ) -> dict[str, Any]:
-        outputsize = int(state.target_history_bars or settings.fxcm_sync_backfill_bars)
-        start_date: str | None = None
-
-        if state.backfill_completed and state.latest_synced_bar_time is not None:
-            overlap = self._interval_delta(state.interval) * max(
-                1,
-                settings.fxcm_sync_incremental_overlap_bars,
-            )
-            incremental_start = state.latest_synced_bar_time - overlap
-            start_date = incremental_start.isoformat()
-            outputsize = self._incremental_outputsize(state.interval)
-
-        return {
-            "symbol": instrument.provider_symbol,
-            "interval": state.interval,
-            "outputsize": outputsize,
-            "start_date": start_date,
-            "end_date": None,
-            "price_type": state.price_type,
-        }
 
     def _parse_request_payload_datetime(self, value: Any) -> datetime | None:
         if isinstance(value, datetime):
@@ -993,9 +952,11 @@ class FXCMMarketSyncService:
     def _normalize_symbol(self, value: str) -> str:
         return market_master_service._normalize_lookup(value)
 
-    def _sort_weight(self, symbol: str) -> int:
+    def _sort_weight(self, symbol: str, hot_symbols: list[str] | None = None) -> int:
+        if not hot_symbols:
+            return 999
         try:
-            return self.hot_symbols.index(symbol)
+            return hot_symbols.index(symbol)
         except ValueError:
             return 999
 
@@ -1080,25 +1041,12 @@ class FXCMMarketSyncService:
         now: datetime,
         skip_weekends: bool,
     ) -> datetime:
-        interval_delta = self._interval_delta(interval)
-        if interval == "1day":
-            next_sync_from = (
-                now.replace(
-                    hour=0,
-                    minute=0,
-                    second=0,
-                    microsecond=0,
-                )
-                + interval_delta
-            )
-        else:
-            interval_seconds = int(interval_delta.total_seconds())
-            current_epoch = int(now.timestamp())
-            next_epoch = ((current_epoch // interval_seconds) + 1) * interval_seconds
-            next_sync_from = datetime.fromtimestamp(next_epoch, tz=timezone.utc)
+        # 为了让更多品种都能轮播抓取，不在特定整点集中触发
+        # 统一设置一个较小间隔来排队等待下一轮（例如 2 分钟）
+        next_sync_from = now + timedelta(minutes=2)
 
         while skip_weekends and next_sync_from.weekday() >= 5:
-            next_sync_from = next_sync_from + interval_delta
+            next_sync_from = next_sync_from + timedelta(days=1)
 
         return next_sync_from
 
