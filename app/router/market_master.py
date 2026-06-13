@@ -3,8 +3,10 @@ from typing import Any, Awaitable
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
 
+from app.clients import db as db_client
 from app.depends.jwt_guard import verify_user
 from app.schemas.response import APIResponse
+from app.services.fxcm_market_sync import fxcm_market_sync_service
 from app.services.market_master import TwelveDataAPIError, market_master_service
 
 
@@ -13,8 +15,6 @@ router = APIRouter(
     tags=["Market Master"],
     # dependencies=[Depends(verify_user)],  暂时注释掉 JWT 验证，后续根据需要开启
 )
-
-
 
 
 def _request_params(request: Request) -> dict[str, Any]:
@@ -308,6 +308,18 @@ async def symbol_search(
     return await _service_response(
         market_master_service.search_symbols(_request_params(request))
     )
+
+
+@router.get(
+    "/sync/status",
+    response_model=APIResponse[Any],
+    summary="获取当前同步状态和运行中的任务",
+)
+async def get_sync_status():
+    async with db_client.async_session() as db:
+        status_info = await fxcm_market_sync_service.get_status(db)
+        running_tasks = await fxcm_market_sync_service.get_running_tasks(db)
+        return APIResponse(data={"status": status_info, "running_tasks": running_tasks})
 
 
 @router.get(

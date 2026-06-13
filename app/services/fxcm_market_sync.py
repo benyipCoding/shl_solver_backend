@@ -370,7 +370,7 @@ class FXCMMarketSyncService:
                 MarketBarSyncState.last_attempt_at.asc().nullsfirst(),
                 MarketBarSyncState.priority.asc(),
             )
-            .limit(1)
+            .limit(10)
         )
         if not force_due:
             stmt = stmt.where(
@@ -492,6 +492,37 @@ class FXCMMarketSyncService:
             "failed_state_count": int(failed_state_count or 0),
             "last_metadata_sync_at": self._last_metadata_sync_at,
         }
+
+    async def get_running_tasks(self, db: AsyncSession) -> list[dict[str, Any]]:
+        stmt = (
+            select(MarketBarSyncState, MarketInstrument)
+            .join(
+                MarketInstrument,
+                MarketInstrument.id == MarketBarSyncState.instrument_id,
+            )
+            .where(MarketBarSyncState.last_status == "RUNNING")
+            .order_by(MarketBarSyncState.last_attempt_at.desc())
+            .limit(50)
+        )
+        rows = (await db.execute(stmt)).all()
+        tasks = []
+        for state, instrument in rows:
+            tasks.append(
+                {
+                    "instrument_id": instrument.id,
+                    "symbol": instrument.symbol,
+                    "provider_symbol": instrument.provider_symbol,
+                    "interval": state.interval,
+                    "price_type": state.price_type,
+                    "sync_mode": state.sync_mode,
+                    "last_attempt_at": state.last_attempt_at,
+                    "target_history_bars": state.target_history_bars,
+                    "backfill_completed": state.backfill_completed,
+                    "earliest_synced_bar_time": state.earliest_synced_bar_time,
+                    "latest_synced_bar_time": state.latest_synced_bar_time,
+                }
+            )
+        return tasks
 
     async def _build_instrument_payload(
         self, symbol: str, hot_symbols: list[str] | None = None
@@ -778,12 +809,17 @@ class FXCMMarketSyncService:
         state.retry_count = 0
         state.sync_mode = "INCREMENTAL" if state.backfill_completed else "BACKFILL"
 
-        state.next_sync_from = self._calculate_next_sync_from(
-            interval=state.interval,
-            now=_utc_now(),
-            skip_weekends=self._normalize_asset_type(instrument.asset_type)
-            not in self.ALWAYS_OPEN_ASSET_TYPES,
-        )
+        if state.backfill_completed:
+            state.next_sync_from = self._calculate_next_sync_from(
+                interval=state.interval,
+                now=_utc_now(),
+                skip_weekends=self._normalize_asset_type(instrument.asset_type)
+                not in self.ALWAYS_OPEN_ASSET_TYPES,
+            )
+        else:
+            # 如果回补未完成，立马进入下一轮调度，不等待 2 分钟
+            state.next_sync_from = _utc_now()
+
         state.updated_at = _utc_now()
         return inserted_count
 
@@ -1151,23 +1187,30 @@ class FXCMMarketSyncScheduler:
     async def _run_loop(self) -> None:
         assert self._stop_event is not None
         while not self._stop_event.is_set():
+            processed_states = 0
             try:
                 async with db_client.async_session() as db:
-                    await self._service.run_cycle(
+                    result = await self._service.run_cycle(
                         db,
                         reason="scheduler",
                         force_metadata=False,
                         force_due=False,
                     )
+                    processed_states = result.processed_states
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("FXCM market scheduler loop failed")
 
             try:
+                delay = (
+                    1.0
+                    if processed_states > 0
+                    else max(15, settings.fxcm_sync_poll_interval_seconds)
+                )
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=max(15, settings.fxcm_sync_poll_interval_seconds),
+                    timeout=delay,
                 )
             except TimeoutError:
                 continue
