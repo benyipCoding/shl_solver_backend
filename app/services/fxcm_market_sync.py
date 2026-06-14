@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
+    """返回当前 UTC 时间，统一全模块的时间基准。"""
     return datetime.now(tz=timezone.utc)
 
 
@@ -44,6 +45,7 @@ class FXCMMarketSyncResult:
     finished_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        """将同步结果对象转换为可序列化字典。"""
         return {
             "reason": self.reason,
             "skipped": self.skipped,
@@ -61,14 +63,26 @@ class FXCMMarketSyncResult:
 
 class FXCMMarketSyncService:
     PROVIDER = "FXCM"
-    SUPPORTED_INTERVALS = ("30min", "1h", "2h", "4h", "1day")
+    SUPPORTED_INTERVALS = (
+        "1min",
+        "5min",
+        "15min",
+        "30min",
+        "1h",
+        "2h",
+        "4h",
+        "1day",
+        "1week",
+    )
     ALWAYS_OPEN_ASSET_TYPES = {"digital currency"}
 
     def __init__(self) -> None:
+        """初始化同步服务运行状态和互斥锁。"""
         self._lock = asyncio.Lock()
         self._last_metadata_sync_at: datetime | None = None
 
     async def get_hot_symbols(self, db: AsyncSession) -> list[str]:
+        """读取数据库热池品种，并去重后返回规范化符号列表。"""
         stmt = select(MarketInstrument.symbol).where(
             MarketInstrument.provider == self.PROVIDER,
             MarketInstrument.is_active.is_(True),
@@ -88,6 +102,7 @@ class FXCMMarketSyncService:
 
     @property
     def sync_intervals(self) -> list[str]:
+        """解析并标准化配置中的同步周期，过滤不支持项。"""
         raw_intervals = [
             item.strip()
             for item in settings.fxcm_sync_intervals.split(",")
@@ -106,9 +121,11 @@ class FXCMMarketSyncService:
         return normalized_intervals or list(self.SUPPORTED_INTERVALS)
 
     def is_running(self) -> bool:
+        """判断当前是否已有同步任务在运行。"""
         return self._lock.locked()
 
     def get_last_metadata_sync_at(self) -> datetime | None:
+        """返回最近一次元数据同步完成时间。"""
         return self._last_metadata_sync_at
 
     async def run_cycle(
@@ -119,6 +136,7 @@ class FXCMMarketSyncService:
         force_metadata: bool = False,
         force_due: bool = False,
     ) -> FXCMMarketSyncResult:
+        """执行一次完整调度周期：必要时同步元数据，再处理到期状态任务。"""
         if self._lock.locked():
             return FXCMMarketSyncResult(
                 reason=reason,
@@ -164,6 +182,7 @@ class FXCMMarketSyncService:
         mode: str,
         force_due: bool = True,
     ) -> FXCMMarketSyncResult:
+        """执行手动触发同步，可按模式只跑 metadata、bars 或全部。"""
         normalized_mode = mode.strip().lower()
         if normalized_mode not in {"all", "metadata", "bars"}:
             normalized_mode = "all"
@@ -209,9 +228,7 @@ class FXCMMarketSyncService:
         interval: str,
         outputsize: int | None = None,
     ) -> bool:
-        """
-        按需拉取：当本地没有某个品种/周期数据时，主动向 FXCM 拉取一次并注册到后台调度中
-        """
+        """本地缺数据时即时拉取，并把品种/周期注册到后台持续同步。"""
         canonical_symbol = market_master_service._resolve_fxcm_symbol(symbol)
 
         stmt = select(MarketInstrument).where(
@@ -284,6 +301,7 @@ class FXCMMarketSyncService:
             return False
 
     async def sync_instruments(self, db: AsyncSession) -> int:
+        """刷新热池品种元数据并同步别名映射。"""
         synced_count = 0
         hot_symbols = await self.get_hot_symbols(db)
         for symbol in hot_symbols:
@@ -303,6 +321,17 @@ class FXCMMarketSyncService:
         return synced_count
 
     async def bootstrap_sync_states(self, db: AsyncSession) -> int:
+        """为热池品种按周期创建或修复同步状态任务。"""
+        # 先禁用所有不在当前支持列表中的旧周期状态，避免它们混入调度队列
+        disable_stmt = select(MarketBarSyncState).where(
+            MarketBarSyncState.provider == self.PROVIDER,
+            MarketBarSyncState.enabled.is_(True),
+            MarketBarSyncState.interval.not_in(self.sync_intervals),
+        )
+        stale_states = (await db.execute(disable_stmt)).scalars().all()
+        for stale in stale_states:
+            stale.enabled = False
+
         stmt = select(MarketInstrument).where(
             MarketInstrument.provider == self.PROVIDER,
             MarketInstrument.is_active.is_(True),
@@ -354,12 +383,32 @@ class FXCMMarketSyncService:
         result: FXCMMarketSyncResult,
         force_due: bool,
     ) -> int:
+        """挑选到期状态并逐个执行同步，记录成功失败统计。"""
         now = _utc_now()
+        bar_count_subquery = (
+            select(
+                MarketOHLCVBar.instrument_id.label("instrument_id"),
+                MarketOHLCVBar.interval.label("interval"),
+                func.count().label("bar_count"),
+            )
+            .where(MarketOHLCVBar.provider == self.PROVIDER)
+            .group_by(MarketOHLCVBar.instrument_id, MarketOHLCVBar.interval)
+            .subquery()
+        )
+
         stmt = (
             select(MarketBarSyncState, MarketInstrument)
             .join(
                 MarketInstrument,
                 MarketInstrument.id == MarketBarSyncState.instrument_id,
+            )
+            .outerjoin(
+                bar_count_subquery,
+                and_(
+                    bar_count_subquery.c.instrument_id
+                    == MarketBarSyncState.instrument_id,
+                    bar_count_subquery.c.interval == MarketBarSyncState.interval,
+                ),
             )
             .where(
                 MarketBarSyncState.provider == self.PROVIDER,
@@ -367,6 +416,7 @@ class FXCMMarketSyncService:
                 MarketInstrument.is_active.is_(True),
             )
             .order_by(
+                func.coalesce(bar_count_subquery.c.bar_count, 0).asc(),
                 MarketBarSyncState.last_attempt_at.asc().nullsfirst(),
                 MarketBarSyncState.priority.asc(),
             )
@@ -429,6 +479,7 @@ class FXCMMarketSyncService:
         return processed
 
     async def get_status(self, db: AsyncSession) -> dict[str, Any]:
+        """汇总当前同步系统状态与核心计数指标。"""
         now = _utc_now()
 
         instrument_count = await db.scalar(
@@ -494,6 +545,7 @@ class FXCMMarketSyncService:
         }
 
     async def get_running_tasks(self, db: AsyncSession) -> list[dict[str, Any]]:
+        """查询最近处于 RUNNING 状态的任务明细。"""
         stmt = (
             select(MarketBarSyncState, MarketInstrument)
             .join(
@@ -527,6 +579,7 @@ class FXCMMarketSyncService:
     async def _build_instrument_payload(
         self, symbol: str, hot_symbols: list[str] | None = None
     ) -> dict[str, Any] | None:
+        """聚合 sidecar 与本地画像，构建可落库的品种元数据载荷。"""
         canonical_symbol = market_master_service._resolve_fxcm_symbol(symbol)
         profile = market_master_service._find_symbol_profile(canonical_symbol)
 
@@ -656,6 +709,7 @@ class FXCMMarketSyncService:
         db: AsyncSession,
         payload: dict[str, Any],
     ) -> MarketInstrument:
+        """按规范化符号插入或更新品种记录。"""
         aliases = payload.pop("aliases", [])
         stmt = select(MarketInstrument).where(
             and_(
@@ -687,6 +741,7 @@ class FXCMMarketSyncService:
         instrument: MarketInstrument,
         aliases: Sequence[dict[str, Any]],
     ) -> None:
+        """同步品种别名表：不存在则新增，存在则更新绑定。"""
         for alias_payload in aliases:
             stmt = select(MarketInstrumentAlias).where(
                 MarketInstrumentAlias.normalized_alias
@@ -714,6 +769,7 @@ class FXCMMarketSyncService:
         state: MarketBarSyncState,
         instrument: MarketInstrument,
     ) -> int:
+        """执行单个状态的增量拉取与历史回补，并更新状态机字段。"""
         state.last_attempt_at = _utc_now()
         state.last_status = "RUNNING"
         state.last_error = None
@@ -768,7 +824,7 @@ class FXCMMarketSyncService:
 
         # --- 第二阶段（后向/回补）：用时间换空间，每次往后推进一小批，直至数据枯竭 ---
         if state.earliest_synced_bar_time is not None and not state.backfill_completed:
-            batch_size = 1000  # 每次仅抓取一小批，不阻塞长连接
+            batch_size = 2000  # 每次仅抓取一小批，不阻塞长连接
             backfill_payload = {
                 "symbol": instrument.provider_symbol,
                 "interval": state.interval,
@@ -791,15 +847,13 @@ class FXCMMarketSyncService:
                 inserted = await self._upsert_bars(db, b_rows)
                 inserted_count += inserted
                 b_bar_times = [row["bar_time"] for row in b_rows]
-                new_earliest = min(b_bar_times)
+                state.earliest_synced_bar_time = self._min_datetime(
+                    state.earliest_synced_bar_time, min(b_bar_times)
+                )
 
-                # 若抓到的最老数据没有更早，或是量极少，说明源头已无更多历史
-                if new_earliest >= state.earliest_synced_bar_time:
-                    state.backfill_completed = True
-                else:
-                    state.earliest_synced_bar_time = new_earliest
-
-                if len(b_rows) < batch_size * 0.9:
+                # FXCM 的历史分页有时会不饱满，不以返回时间是否推进作为枯竭判断
+                # 只有极少条（不足 5%）才认为到达数据底部
+                if len(b_rows) < batch_size * 0.05:
                     state.backfill_completed = True
             else:
                 state.backfill_completed = True
@@ -817,13 +871,14 @@ class FXCMMarketSyncService:
                 not in self.ALWAYS_OPEN_ASSET_TYPES,
             )
         else:
-            # 如果回补未完成，立马进入下一轮调度，不等待 2 分钟
-            state.next_sync_from = _utc_now()
+            # 如果回补未完成，增加短暂延迟(10秒)并进入下一轮，防止密集的请求导致504或霸占调度时间
+            state.next_sync_from = _utc_now() + timedelta(seconds=10)
 
         state.updated_at = _utc_now()
         return inserted_count
 
     def _parse_request_payload_datetime(self, value: Any) -> datetime | None:
+        """把请求载荷中的时间值解析为 UTC datetime。"""
         if isinstance(value, datetime):
             if value.tzinfo is None:
                 return value.replace(tzinfo=timezone.utc)
@@ -846,6 +901,7 @@ class FXCMMarketSyncService:
         values: Sequence[Mapping[str, Any]],
         meta: Mapping[str, Any] | None,
     ) -> list[dict[str, Any]]:
+        """将 sidecar 返回的 K 线数据转换为数据库行结构。"""
         source_interval = None
         if isinstance(meta, Mapping):
             source_interval = self._coalesce_str(meta.get("provider_interval"))
@@ -885,6 +941,7 @@ class FXCMMarketSyncService:
         db: AsyncSession,
         rows: Sequence[dict[str, Any]],
     ) -> int:
+        """批量 UPSERT K 线数据，冲突时用新值覆盖。"""
         if not rows:
             return 0
 
@@ -913,6 +970,7 @@ class FXCMMarketSyncService:
         canonical_symbol: str,
         profile: Mapping[str, Any] | None,
     ) -> Mapping[str, Any] | None:
+        """从搜索结果中优先挑选与目标符号最匹配的条目。"""
         if not isinstance(items, Sequence):
             return None
 
@@ -950,6 +1008,7 @@ class FXCMMarketSyncService:
         profile: Mapping[str, Any] | None,
         search_item: Mapping[str, Any] | None,
     ) -> list[dict[str, Any]]:
+        """生成去重后的别名集合，供别名表同步使用。"""
         alias_specs: list[tuple[str, str, int]] = [
             (canonical_symbol, "CANONICAL", 1),
             (provider_symbol, "PROVIDER", 2),
@@ -986,9 +1045,11 @@ class FXCMMarketSyncService:
         return aliases
 
     def _normalize_symbol(self, value: str) -> str:
+        """规范化符号文本，便于一致匹配。"""
         return market_master_service._normalize_lookup(value)
 
     def _sort_weight(self, symbol: str, hot_symbols: list[str] | None = None) -> int:
+        """根据热池顺序计算排序权重，越靠前权重越小。"""
         if not hot_symbols:
             return 999
         try:
@@ -997,6 +1058,7 @@ class FXCMMarketSyncService:
             return 999
 
     def _metadata_sync_due(self) -> bool:
+        """判断是否到了下一次元数据同步窗口。"""
         if self._last_metadata_sync_at is None:
             return True
         due_at = self._last_metadata_sync_at + timedelta(
@@ -1005,6 +1067,7 @@ class FXCMMarketSyncService:
         return _utc_now() >= due_at
 
     def _incremental_outputsize(self, interval: str) -> int:
+        """按周期返回增量拉取建议条数。"""
         if interval in {"1month", "1week", "1day"}:
             return settings.fxcm_sync_1day_incremental_outputsize
         if interval in {"8h", "4h"}:
@@ -1018,12 +1081,14 @@ class FXCMMarketSyncService:
         return settings.fxcm_sync_1h_incremental_outputsize
 
     def _state_priority(self, interval: str) -> int:
+        """根据周期在配置中的顺序计算任务优先级。"""
         try:
             return (self.sync_intervals.index(interval) + 1) * 10
         except ValueError:
             return 100
 
     def _interval_delta(self, interval: str) -> timedelta:
+        """把周期字符串转换为对应的时间跨度。"""
         if interval == "1month":
             return timedelta(days=30)
         if interval == "1week":
@@ -1055,6 +1120,7 @@ class FXCMMarketSyncService:
         instrument: MarketInstrument,
         current_time: datetime,
     ) -> datetime | None:
+        """若非 7x24 品种且当前在周末，返回下周一恢复时间。"""
         asset_type = self._normalize_asset_type(instrument.asset_type)
         if asset_type in self.ALWAYS_OPEN_ASSET_TYPES:
             return None
@@ -1077,6 +1143,7 @@ class FXCMMarketSyncService:
         now: datetime,
         skip_weekends: bool,
     ) -> datetime:
+        """计算下一次调度时间，默认小间隔轮询并可跳过周末。"""
         # 为了让更多品种都能轮播抓取，不在特定整点集中触发
         # 统一设置一个较小间隔来排队等待下一轮（例如 2 分钟）
         next_sync_from = now + timedelta(minutes=2)
@@ -1087,12 +1154,14 @@ class FXCMMarketSyncService:
         return next_sync_from
 
     def _normalize_asset_type(self, asset_type: str | None) -> str | None:
+        """标准化资产类型文本，便于规则判断。"""
         if asset_type is None:
             return None
         normalized = asset_type.strip().casefold()
         return normalized or None
 
     def _parse_bar_time(self, item: Mapping[str, Any]) -> datetime | None:
+        """从 bar 项中解析时间，优先 timestamp，其次 datetime。"""
         timestamp = self._to_int(item.get("timestamp"))
         if timestamp is not None:
             return datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -1109,6 +1178,7 @@ class FXCMMarketSyncService:
         return parsed.astimezone(timezone.utc)
 
     def _coalesce_str(self, *values: Any) -> str | None:
+        """返回第一个非空字符串值。"""
         for value in values:
             if value is None:
                 continue
@@ -1118,6 +1188,7 @@ class FXCMMarketSyncService:
         return None
 
     def _to_int(self, value: Any) -> int | None:
+        """安全转换为 int，失败返回 None。"""
         if value in (None, ""):
             return None
         try:
@@ -1126,6 +1197,7 @@ class FXCMMarketSyncService:
             return None
 
     def _to_decimal(self, value: Any) -> Decimal | None:
+        """安全转换为 Decimal，失败返回 None。"""
         if value in (None, ""):
             return None
         try:
@@ -1138,6 +1210,7 @@ class FXCMMarketSyncService:
         current: datetime | None,
         new_value: datetime,
     ) -> datetime:
+        """在 current 与 new_value 之间取更早时间。"""
         if current is None:
             return new_value
         return min(current, new_value)
@@ -1147,6 +1220,7 @@ class FXCMMarketSyncService:
         current: datetime | None,
         new_value: datetime,
     ) -> datetime:
+        """在 current 与 new_value 之间取更晚时间。"""
         if current is None:
             return new_value
         return max(current, new_value)
@@ -1157,14 +1231,17 @@ fxcm_market_sync_service = FXCMMarketSyncService()
 
 class FXCMMarketSyncScheduler:
     def __init__(self, service: FXCMMarketSyncService) -> None:
+        """初始化调度器并绑定同步服务实例。"""
         self._service = service
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
 
     def is_running(self) -> bool:
+        """判断调度循环任务是否仍在运行。"""
         return self._task is not None and not self._task.done()
 
     async def start(self) -> None:
+        """启动后台调度循环（若开关开启且当前未运行）。"""
         if not settings.fxcm_sync_enabled or self.is_running():
             return
         self._stop_event = asyncio.Event()
@@ -1174,6 +1251,7 @@ class FXCMMarketSyncScheduler:
         )
 
     async def stop(self) -> None:
+        """停止后台调度循环并回收任务句柄。"""
         if self._task is None:
             return
         assert self._stop_event is not None
@@ -1185,6 +1263,7 @@ class FXCMMarketSyncScheduler:
         self._stop_event = None
 
     async def _run_loop(self) -> None:
+        """调度主循环：周期性执行 run_cycle，并按负载调整等待时间。"""
         assert self._stop_event is not None
         while not self._stop_event.is_set():
             processed_states = 0
