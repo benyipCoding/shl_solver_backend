@@ -319,7 +319,15 @@ async def get_sync_status():
     async with db_client.async_session() as db:
         status_info = await fxcm_market_sync_service.get_status(db)
         running_tasks = await fxcm_market_sync_service.get_running_tasks(db)
-        return APIResponse(data={"status": status_info, "running_tasks": running_tasks})
+        sync_states = await fxcm_market_sync_service.get_sync_states(db)
+        return APIResponse(
+            data={
+                "status": status_info,
+                "running_tasks": running_tasks,
+                "states": sync_states["items"],
+                "rotation": sync_states["rotation"],
+            }
+        )
 
 
 @router.get(

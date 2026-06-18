@@ -22,6 +22,10 @@ from app.services.fxcm_market_sync.intervals import (
     resolve_sync_intervals,
     state_priority,
 )
+from app.services.fxcm_market_sync.scheduling_policy import (
+    infer_asset_category,
+    is_allowed_today,
+)
 from app.services.fxcm_market_sync.state_sync import state_sync_handler
 from app.services.fxcm_market_sync.types import FXCMMarketSyncResult, utc_now
 from app.services.fxcm_market_sync.utils import normalize_symbol
@@ -367,6 +371,100 @@ class FXCMMarketSyncService:
                 }
             )
         return tasks
+
+    async def get_sync_states(self, db: AsyncSession) -> dict[str, Any]:
+        """返回全部同步状态行及今日轮换策略上下文。"""
+        now = utc_now()
+        weekday = now.weekday()
+        rotation_schedule = [
+            {"weekday": 0, "category": "forex", "label": "外汇"},
+            {"weekday": 1, "category": "index", "label": "指数"},
+            {"weekday": 2, "category": "commodity", "label": "大宗商品"},
+            {"weekday": 3, "category": "index", "label": "指数"},
+            {"weekday": 4, "category": "forex", "label": "外汇"},
+            {"weekday": 5, "category": "crypto", "label": "加密货币"},
+            {"weekday": 6, "category": "commodity", "label": "大宗商品"},
+        ]
+        today_rotation = next(
+            (item for item in rotation_schedule if item["weekday"] == weekday),
+            None,
+        )
+
+        stmt = (
+            select(MarketBarSyncState, MarketInstrument)
+            .join(
+                MarketInstrument,
+                MarketInstrument.id == MarketBarSyncState.instrument_id,
+            )
+            .where(MarketBarSyncState.provider == self.PROVIDER)
+            .order_by(
+                MarketInstrument.symbol.asc(),
+                MarketBarSyncState.priority.asc(),
+                MarketBarSyncState.interval.asc(),
+            )
+        )
+        rows = (await db.execute(stmt)).all()
+
+        items: list[dict[str, Any]] = []
+        for state, instrument in rows:
+            category = infer_asset_category(instrument)
+            allowed_today = is_allowed_today(instrument, now)
+            next_sync_from = state.next_sync_from
+            if next_sync_from is None:
+                seconds_until_next_sync = 0
+                is_due = True
+            elif next_sync_from <= now:
+                seconds_until_next_sync = 0
+                is_due = True
+            else:
+                seconds_until_next_sync = int(
+                    (next_sync_from - now).total_seconds()
+                )
+                is_due = False
+
+            items.append(
+                {
+                    "id": state.id,
+                    "instrument_id": instrument.id,
+                    "symbol": instrument.symbol,
+                    "provider_symbol": instrument.provider_symbol,
+                    "asset_type": instrument.asset_type,
+                    "asset_category": category,
+                    "allowed_today": allowed_today,
+                    "interval": state.interval,
+                    "price_type": state.price_type,
+                    "enabled": state.enabled,
+                    "priority": state.priority,
+                    "target_history_bars": state.target_history_bars,
+                    "sync_mode": state.sync_mode,
+                    "earliest_synced_bar_time": state.earliest_synced_bar_time,
+                    "latest_synced_bar_time": state.latest_synced_bar_time,
+                    "last_requested_start_at": state.last_requested_start_at,
+                    "last_requested_end_at": state.last_requested_end_at,
+                    "next_sync_from": next_sync_from,
+                    "seconds_until_next_sync": seconds_until_next_sync,
+                    "is_due": is_due,
+                    "backfill_completed": state.backfill_completed,
+                    "last_status": state.last_status,
+                    "last_attempt_at": state.last_attempt_at,
+                    "last_success_at": state.last_success_at,
+                    "retry_count": state.retry_count,
+                    "last_error": state.last_error,
+                    "meta": state.meta,
+                    "created_at": state.created_at,
+                    "updated_at": state.updated_at,
+                }
+            )
+
+        return {
+            "rotation": {
+                "weekday": weekday,
+                "today": today_rotation,
+                "schedule": rotation_schedule,
+                "server_time": now,
+            },
+            "items": items,
+        }
 
     def _metadata_sync_due(self) -> bool:
         if self._last_metadata_sync_at is None:
