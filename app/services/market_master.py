@@ -1082,13 +1082,22 @@ class MarketMasterService:
 
     def _resolve_interval_name(self, interval: str) -> str:
         aliases = {
+            "m1": "1min",
+            "1m": "1min",
+            "m5": "5min",
+            "5m": "5min",
+            "m15": "15min",
+            "15m": "15min",
             "m30": "30min",
             "30m": "30min",
             "30min": "30min",
             "h1": "1h",
             "h2": "2h",
             "h4": "4h",
+            "h8": "8h",
+            "8h": "8h",
             "1d": "1day",
+            "1w": "1week",
             "1wk": "1week",
             "1mo": "1month",
             "60m": "1h",

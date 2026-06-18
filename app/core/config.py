@@ -66,7 +66,7 @@ class Settings(BaseSettings):
         "BTC/USD,ETH/USD,XAU/USD,XAG/USD,USOil,UKOil,"
         "US30,NAS100,SPX500,USDOLLAR"
     )
-    fxcm_sync_intervals: str = "30min,1h,2h,4h,1day"
+    fxcm_sync_intervals: str = "1min,5min,15min,30min,1h,2h,4h,8h,1day,1week"
     fxcm_sync_backfill_bars: int = 1000
     fxcm_sync_metadata_interval_hours: int = 12
     fxcm_sync_poll_interval_seconds: int = 60
