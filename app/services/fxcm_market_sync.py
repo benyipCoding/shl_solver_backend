@@ -388,11 +388,10 @@ class FXCMMarketSyncService:
         bar_count_subquery = (
             select(
                 MarketOHLCVBar.instrument_id.label("instrument_id"),
-                MarketOHLCVBar.interval.label("interval"),
                 func.count().label("bar_count"),
             )
             .where(MarketOHLCVBar.provider == self.PROVIDER)
-            .group_by(MarketOHLCVBar.instrument_id, MarketOHLCVBar.interval)
+            .group_by(MarketOHLCVBar.instrument_id)
             .subquery()
         )
 
@@ -404,11 +403,7 @@ class FXCMMarketSyncService:
             )
             .outerjoin(
                 bar_count_subquery,
-                and_(
-                    bar_count_subquery.c.instrument_id
-                    == MarketBarSyncState.instrument_id,
-                    bar_count_subquery.c.interval == MarketBarSyncState.interval,
-                ),
+                bar_count_subquery.c.instrument_id == MarketBarSyncState.instrument_id,
             )
             .where(
                 MarketBarSyncState.provider == self.PROVIDER,
@@ -431,6 +426,16 @@ class FXCMMarketSyncService:
             )
 
         rows = (await db.execute(stmt)).all()
+        # 每个品种每轮最多处理 1 个 interval，避免 BTC/ETH 等多周期品种独占全部槽位
+        seen_instrument_ids: set[int] = set()
+        deduped_rows = []
+        for row in rows:
+            iid = row[1].id  # MarketInstrument.id
+            if iid not in seen_instrument_ids:
+                seen_instrument_ids.add(iid)
+                deduped_rows.append(row)
+        rows = deduped_rows
+
         processed = 0
         for state, instrument in rows:
             processed += 1
@@ -439,14 +444,31 @@ class FXCMMarketSyncService:
             interval = state.interval
             price_type = state.price_type
             instrument_symbol = instrument.symbol
-            weekend_resume_at = self._weekend_resume_at(instrument, now)
-            if weekend_resume_at is not None:
-                state.next_sync_from = weekend_resume_at
+
+            # 1. 每日硬性轮换策略：只允许特定品类在今天运行
+            if not self._is_allowed_today(instrument, now):
+                # 如果今天不轮到它，直接把下次调度时间推迟到明天凌晨
+                tomorrow = (now + timedelta(days=1)).replace(
+                    hour=0, minute=5, second=0, microsecond=0
+                )
+                state.next_sync_from = tomorrow
                 state.last_status = "SKIPPED"
-                state.last_error = None
+                state.last_error = "Skipped by daily category rotation policy"
                 state.last_attempt_at = now
                 await db.commit()
                 continue
+
+            # 2. 周末过滤策略：只有当历史回补已完成，进入增量监听模式时，传统品类才跳过周末
+            if state.backfill_completed:
+                weekend_resume_at = self._weekend_resume_at(instrument, now)
+                if weekend_resume_at is not None:
+                    state.next_sync_from = weekend_resume_at
+                    state.last_status = "SKIPPED"
+                    state.last_error = None
+                    state.last_attempt_at = now
+                    await db.commit()
+                    continue
+
             try:
                 inserted = await self._sync_single_state(db, state, instrument)
                 await db.commit()
@@ -871,8 +893,9 @@ class FXCMMarketSyncService:
                 not in self.ALWAYS_OPEN_ASSET_TYPES,
             )
         else:
-            # 如果回补未完成，增加短暂延迟(10秒)并进入下一轮，防止密集的请求导致504或霸占调度时间
-            state.next_sync_from = _utc_now() + timedelta(seconds=10)
+            # 回补未完成：与 INCREMENTAL 使用相同的延迟(120秒)，让所有品种公平竞争调度时间
+            # 如果此处延迟远短于 INCREMENTAL 的 2 分钟，BTC/ETH 这类无限历史品种会霸占队列
+            state.next_sync_from = _utc_now() + timedelta(seconds=120)
 
         state.updated_at = _utc_now()
         return inserted_count
@@ -1135,6 +1158,69 @@ class FXCMMarketSyncService:
             microsecond=0,
         )
         return monday
+
+    def _is_allowed_today(
+        self, instrument: MarketInstrument, current_time: datetime
+    ) -> bool:
+        """根据硬性调度策略：不同日期采集不同品类，防止单一品类霸占队列。"""
+        weekday = current_time.weekday()
+        asset_type = self._normalize_asset_type(instrument.asset_type) or ""
+
+        if "digital" in asset_type or "crypto" in asset_type:
+            category = "crypto"
+        elif "forex" in asset_type or "fx" in asset_type or "currency" in asset_type:
+            category = "forex"
+        elif "index" in asset_type or "stock" in asset_type or "equity" in asset_type:
+            category = "index"
+        elif (
+            "metal" in asset_type
+            or "commodity" in asset_type
+            or "oil" in asset_type
+            or "energy" in asset_type
+        ):
+            category = "commodity"
+        else:
+            # 通过 symbol 推断兜底
+            symbol = (instrument.symbol or "").upper()
+            if symbol in ("BTC/USD", "ETH/USD"):
+                category = "crypto"
+            elif symbol in (
+                "US30",
+                "NAS100",
+                "SPX500",
+                "UK100",
+                "GER30",
+                "FRA40",
+                "USDOLLAR",
+            ):
+                category = "index"
+            elif "XAU" in symbol or "XAG" in symbol or "OIL" in symbol:
+                category = "commodity"
+            elif len(symbol) == 7 and "/" in symbol:
+                category = "forex"
+            else:
+                category = "other"
+
+        if category == "other":
+            return True
+
+        # 每日品类轮换（保证覆盖不同周期，今天是什么品类就只采这一个类别）
+        if weekday == 0:  # 周一
+            return category == "forex"
+        elif weekday == 1:  # 周二
+            return category == "index"
+        elif weekday == 2:  # 周三
+            return category == "commodity"
+        elif weekday == 3:  # 周四
+            return category == "crypto"
+        elif weekday == 4:  # 周五
+            return category == "forex"
+        elif weekday == 5:  # 周六
+            return category == "index"
+        elif weekday == 6:  # 周日
+            return category == "commodity"
+
+        return True
 
     def _calculate_next_sync_from(
         self,
