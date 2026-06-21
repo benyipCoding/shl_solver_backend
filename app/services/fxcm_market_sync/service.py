@@ -417,9 +417,7 @@ class FXCMMarketSyncService:
                 seconds_until_next_sync = 0
                 is_due = True
             else:
-                seconds_until_next_sync = int(
-                    (next_sync_from - now).total_seconds()
-                )
+                seconds_until_next_sync = int((next_sync_from - now).total_seconds())
                 is_due = False
 
             items.append(
