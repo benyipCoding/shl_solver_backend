@@ -45,7 +45,9 @@ class MarketInstrument(Base, TimestampMixin):
     )
 
     provider = Column(String(20), nullable=False, default="FXCM", comment="数据供应商")
-    symbol = Column(String(64), nullable=False, index=True, comment="对外暴露的规范代码")
+    symbol = Column(
+        String(64), nullable=False, index=True, comment="对外暴露的规范代码"
+    )
     normalized_symbol = Column(
         String(64),
         nullable=False,

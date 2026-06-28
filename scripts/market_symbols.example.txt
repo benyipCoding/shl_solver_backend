@@ -1,0 +1,7 @@
+# One FXCM symbol per line. Lines starting with # are ignored.
+# Use with: python scripts/gen_market_instruments_sql.py --picklist scripts/market_symbols.example.txt
+
+GER30
+UK100
+SOL/USD
+AAPL.us
