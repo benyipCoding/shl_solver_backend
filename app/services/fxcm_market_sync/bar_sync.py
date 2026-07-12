@@ -1,12 +1,17 @@
 from datetime import timedelta
 from typing import Any, Mapping, Sequence
 
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.market_data import MarketBarSyncState, MarketInstrument, MarketOHLCVBar
-from app.services.fxcm_market_sync.constants import ALWAYS_OPEN_ASSET_TYPES, PROVIDER
+from app.services.fxcm_market_sync.constants import (
+    ALWAYS_OPEN_ASSET_TYPES,
+    BACKFILL_EARLIEST_DATE,
+    PROVIDER,
+)
 from app.services.fxcm_market_sync.intervals import (
     calculate_next_sync_from,
     incremental_outputsize,
@@ -39,6 +44,8 @@ class BarSyncHandler:
         state.last_attempt_at = utc_now()
         state.last_status = "RUNNING"
         state.last_error = None
+
+        await self._hydrate_state_from_storage(db, state)
 
         inserted_count = 0
 
@@ -86,7 +93,11 @@ class BarSyncHandler:
                 forward_payload.get("end_date")
             )
 
-        if state.earliest_synced_bar_time is not None and not state.backfill_completed:
+        if (
+            state.earliest_synced_bar_time is not None
+            and not state.backfill_completed
+            and state.earliest_synced_bar_time > BACKFILL_EARLIEST_DATE
+        ):
             batch_size = 2000
             backfill_payload = {
                 "symbol": instrument.provider_symbol,
@@ -114,10 +125,18 @@ class BarSyncHandler:
                     state.earliest_synced_bar_time, min(b_bar_times)
                 )
 
-                if len(b_rows) < batch_size * 0.05:
+                if (
+                    state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE
+                    or len(b_rows) < batch_size * 0.05
+                ):
                     state.backfill_completed = True
             else:
                 state.backfill_completed = True
+        elif (
+            state.earliest_synced_bar_time is not None
+            and state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE
+        ):
+            state.backfill_completed = True
 
         state.last_success_at = utc_now()
         state.last_status = "SUCCESS"
@@ -137,6 +156,47 @@ class BarSyncHandler:
         state.updated_at = utc_now()
         return inserted_count
 
+    async def _hydrate_state_from_storage(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+    ) -> None:
+        """根据本地存量 K 线修正同步水位；1990 年前数据不再回补。"""
+        min_bar_time = await db.scalar(
+            select(func.min(MarketOHLCVBar.bar_time)).where(
+                MarketOHLCVBar.instrument_id == state.instrument_id,
+                MarketOHLCVBar.interval == state.interval,
+                MarketOHLCVBar.price_type == state.price_type,
+                MarketOHLCVBar.provider == PROVIDER,
+            )
+        )
+        max_bar_time = await db.scalar(
+            select(func.max(MarketOHLCVBar.bar_time)).where(
+                MarketOHLCVBar.instrument_id == state.instrument_id,
+                MarketOHLCVBar.interval == state.interval,
+                MarketOHLCVBar.price_type == state.price_type,
+                MarketOHLCVBar.provider == PROVIDER,
+            )
+        )
+
+        if min_bar_time is not None:
+            state.earliest_synced_bar_time = min_datetime(
+                state.earliest_synced_bar_time, min_bar_time
+            )
+        if max_bar_time is not None:
+            state.latest_synced_bar_time = max_datetime(
+                state.latest_synced_bar_time, max_bar_time
+            )
+
+        if state.backfill_completed:
+            return
+
+        if (
+            min_bar_time is not None
+            and min_bar_time <= BACKFILL_EARLIEST_DATE
+        ):
+            state.backfill_completed = True
+
     def build_bar_rows(
         self,
         *,
@@ -155,6 +215,8 @@ class BarSyncHandler:
             bar_time = parse_bar_time(item)
             close_price = to_decimal(item.get("close"))
             if bar_time is None or close_price is None:
+                continue
+            if bar_time < BACKFILL_EARLIEST_DATE:
                 continue
 
             open_price = to_decimal(item.get("open")) or close_price

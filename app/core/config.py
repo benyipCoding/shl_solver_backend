@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     fxcm_sync_1h_incremental_outputsize: int = 200
     fxcm_sync_1day_incremental_outputsize: int = 60
 
+    # Market data replica (CLI script scripts/sync_market_to_prod.py only)
+    market_replica_database_url_sync: str | None = None
+    market_replica_batch_size: int = 2000
+    market_replica_overlap_bars: int = 2
+
     # PostHog
     posthog_api_key: str
     posthog_host: str
