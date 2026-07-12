@@ -24,7 +24,9 @@ def capture_event(distinct_id: str, event_name: str, properties: dict = None):
     if ph_client:
         try:
             ph_client.capture(
-                distinct_id, event=event_name, properties=properties or {}
+                event=event_name,
+                distinct_id=distinct_id,
+                properties=properties or {},
             )
         except Exception as e:
             logger.error(f"PostHog capture error: {e}")
@@ -36,6 +38,6 @@ def identify_user(distinct_id: str, properties: dict = None):
     """
     if ph_client:
         try:
-            ph_client.identify(distinct_id, properties=properties or {})
+            ph_client.set(distinct_id=distinct_id, properties=properties or {})
         except Exception as e:
             logger.error(f"PostHog identify error: {e}")
