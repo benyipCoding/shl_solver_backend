@@ -512,19 +512,39 @@ async def get_kline_defaults(
 
 
 @router.get(
+    "/search/markets",
+    response_model=APIResponse[Any],
+    summary="获取可搜索的热门品类",
+    description=(
+        "从 MarketInstrument 表聚合当前可搜索、已启用标的的 distinct market 字段，"
+        "供前端热门品类快捷入口使用。"
+    ),
+)
+async def list_search_markets():
+    return await _service_response(market_master_service.list_search_markets())
+
+
+@router.get(
     "/search/unified",
     response_model=APIResponse[Any],
     summary="统一市场搜索结构",
     description=(
         "对 FXCM offers 搜索结果做前端友好归一化，统一返回 symbol、label、market、"
         "asset_type、country、currency 等固定字段，并补上关键标的的手工映射。"
+        "支持按 keyword 搜索，或按 market（MarketInstrument.market）浏览品类。"
     ),
 )
 async def get_unified_search(
-    keyword: str = Query(
-        ...,
-        min_length=1,
-        description="搜索关键词，可传代码、简称或公司名片段。",
+    keyword: str | None = Query(
+        None,
+        description="搜索关键词，可传代码、简称或公司名片段。与 market 至少传一个。",
+    ),
+    market: str | None = Query(
+        None,
+        description=(
+            "按 MarketInstrument.market 过滤/浏览品类。"
+            "取值来自 /search/markets，例如 Forex、Crypto、Commodities。"
+        ),
     ),
     outputsize: int = Query(
         10,
@@ -540,6 +560,7 @@ async def get_unified_search(
     return await _service_response(
         market_master_service.search_unified(
             keyword=keyword,
+            market=market,
             outputsize=outputsize,
             show_plan=show_plan,
         )

@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.clients import db as db_client
 from app.models.market_data import MarketInstrument, MarketOHLCVBar
 from app.services.fxcm_sidecar import FXCMSidecarError, fxcm_sidecar_service
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 
 class TwelveDataAPIError(Exception):
@@ -67,6 +67,15 @@ class MarketMasterService:
     ALWAYS_OPEN_ASSET_TYPES = {"digital currency"}
     HOLIDAY_LIKE_STALE_MIN_CANDLES = 3
     MARKET_MOVER_DIRECTIONS = {"gainers", "losers"}
+    MARKET_DISPLAY_LABELS = {
+        "forex": "外汇",
+        "crypto": "加密货币",
+        "commodities": "大宗商品",
+        "precious metals": "贵金属",
+        "indices": "指数",
+        "stocks": "股票",
+        "etf": "ETF",
+    }
     FXCM_MARKET_MOVER_MARKETS = {
         "stocks",
         "etf",
@@ -337,19 +346,52 @@ class MarketMasterService:
             "data": [self._build_symbol_search_record(item) for item in items],
         }
 
+    async def list_search_markets(self) -> dict[str, Any]:
+        async with db_client.async_session() as db:
+            stmt = (
+                select(
+                    MarketInstrument.market,
+                    func.count().label("symbol_count"),
+                )
+                .where(
+                    MarketInstrument.provider == "FXCM",
+                    MarketInstrument.is_searchable.is_(True),
+                    MarketInstrument.is_active.is_(True),
+                    MarketInstrument.market.is_not(None),
+                    MarketInstrument.market != "",
+                )
+                .group_by(MarketInstrument.market)
+                .order_by(func.count().desc(), MarketInstrument.market.asc())
+            )
+            rows = (await db.execute(stmt)).all()
+
+        items = [
+            {
+                "market": market,
+                "label": self._market_display_label(market),
+                "symbol_count": int(symbol_count or 0),
+            }
+            for market, symbol_count in rows
+            if self._to_str(market)
+        ]
+        return {"count": len(items), "items": items}
+
     async def search_unified(
         self,
         *,
-        keyword: str,
+        keyword: str | None = None,
+        market: str | None = None,
         outputsize: int = 10,
         show_plan: bool = False,
     ) -> dict[str, Any]:
         normalized_keyword = (self._to_str(keyword) or "").strip()
-        if not normalized_keyword:
+        resolved_market = await self._resolve_search_market(market)
+
+        if not normalized_keyword and resolved_market is None:
             raise TwelveDataAPIError(
                 status_code=400,
-                message="keyword is required",
-                payload={"field": "keyword"},
+                message="keyword or market is required",
+                payload={"fields": ["keyword", "market"]},
             )
 
         bounded_outputsize = self._bounded_int(
@@ -358,7 +400,19 @@ class MarketMasterService:
             minimum=1,
             maximum=30,
         )
-        items = await self._fetch_search_items(normalized_keyword, bounded_outputsize)
+
+        if normalized_keyword:
+            items = await self._fetch_search_items(
+                normalized_keyword,
+                bounded_outputsize,
+                market=resolved_market,
+            )
+        else:
+            items = await self._fetch_market_items(
+                resolved_market or "",
+                bounded_outputsize,
+            )
+
         normalized_items = [self._normalize_search_item(item) for item in items]
 
         if not show_plan:
@@ -366,7 +420,13 @@ class MarketMasterService:
                 item.pop("provider_plan", None)
 
         return {
-            "keyword": normalized_keyword,
+            "keyword": normalized_keyword or None,
+            "market": resolved_market,
+            "market_label": (
+                self._market_display_label(resolved_market)
+                if resolved_market
+                else None
+            ),
             "count": len(normalized_items),
             "items": normalized_items,
         }
@@ -622,43 +682,45 @@ class MarketMasterService:
         self,
         keyword: str,
         outputsize: int,
+        *,
+        market: str | None = None,
     ) -> list[dict[str, Any]]:
         alias_items = self._search_alias_items(keyword)
+        if market is not None:
+            alias_items = [
+                item
+                for item in alias_items
+                if (self._to_str(item.get("market")) or "").casefold()
+                == market.casefold()
+            ]
+
         clean_keyword = keyword.strip()
         search_limit = min(120, max(outputsize * 4, outputsize))
+        filters = [
+            MarketInstrument.provider == "FXCM",
+            MarketInstrument.is_searchable.is_(True),
+            MarketInstrument.is_active.is_(True),
+            or_(
+                MarketInstrument.symbol.ilike(f"%{clean_keyword}%"),
+                MarketInstrument.name.ilike(f"%{clean_keyword}%"),
+                MarketInstrument.provider_symbol.ilike(f"%{clean_keyword}%"),
+            ),
+        ]
+        if market is not None:
+            filters.append(func.lower(MarketInstrument.market) == market.casefold())
 
         fxcm_items = []
         async with db_client.async_session() as db:
             stmt = (
                 select(MarketInstrument)
-                .where(
-                    MarketInstrument.provider == "FXCM",
-                    MarketInstrument.is_searchable.is_(True),
-                    MarketInstrument.is_active.is_(True),
-                    or_(
-                        MarketInstrument.symbol.ilike(f"%{clean_keyword}%"),
-                        MarketInstrument.name.ilike(f"%{clean_keyword}%"),
-                        MarketInstrument.provider_symbol.ilike(f"%{clean_keyword}%"),
-                    ),
-                )
+                .where(*filters)
                 .order_by(MarketInstrument.sort_weight.asc())
                 .limit(search_limit)
             )
 
             instruments = (await db.execute(stmt)).scalars().all()
             for inst in instruments:
-                fxcm_items.append(
-                    {
-                        "symbol": inst.symbol,
-                        "instrument_name": inst.name,
-                        "exchange": inst.exchange,
-                        "mic_code": inst.mic_code,
-                        "exchange_timezone": inst.exchange_timezone,
-                        "instrument_type": inst.asset_type,
-                        "country": inst.country,
-                        "currency": inst.currency,
-                    }
-                )
+                fxcm_items.append(self._instrument_to_search_item(inst))
 
         normalized_items = [
             self._overlay_search_profile(item)
@@ -668,6 +730,82 @@ class MarketMasterService:
 
         return self._dedupe_search_items(
             normalized_items + alias_items, limit=outputsize
+        )
+
+    async def _fetch_market_items(
+        self,
+        market: str,
+        outputsize: int,
+    ) -> list[dict[str, Any]]:
+        fxcm_items: list[dict[str, Any]] = []
+
+        async with db_client.async_session() as db:
+            stmt = (
+                select(MarketInstrument)
+                .where(
+                    MarketInstrument.provider == "FXCM",
+                    MarketInstrument.is_searchable.is_(True),
+                    MarketInstrument.is_active.is_(True),
+                    func.lower(MarketInstrument.market) == market.casefold(),
+                )
+                .order_by(MarketInstrument.sort_weight.asc())
+                .limit(outputsize)
+            )
+            instruments = (await db.execute(stmt)).scalars().all()
+            for inst in instruments:
+                fxcm_items.append(self._instrument_to_search_item(inst))
+
+        normalized_items = [
+            self._overlay_search_profile(item)
+            for item in fxcm_items
+            if isinstance(item, Mapping)
+        ]
+        return self._dedupe_search_items(normalized_items, limit=outputsize)
+
+    def _instrument_to_search_item(self, inst: MarketInstrument) -> dict[str, Any]:
+        return {
+            "symbol": inst.symbol,
+            "instrument_name": inst.name,
+            "exchange": inst.exchange,
+            "mic_code": inst.mic_code,
+            "exchange_timezone": inst.exchange_timezone,
+            "instrument_type": inst.asset_type,
+            "market": inst.market,
+            "country": inst.country,
+            "currency": inst.currency,
+        }
+
+    async def _resolve_search_market(self, market: str | None) -> str | None:
+        requested = (self._to_str(market) or "").strip()
+        if not requested:
+            return None
+
+        markets_payload = await self.list_search_markets()
+        available = [
+            self._to_str(item.get("market"))
+            for item in markets_payload.get("items") or []
+            if self._to_str(item.get("market"))
+        ]
+        for available_market in available:
+            if available_market and available_market.casefold() == requested.casefold():
+                return available_market
+
+        raise TwelveDataAPIError(
+            status_code=400,
+            message="Unsupported market",
+            payload={
+                "field": "market",
+                "allowed": available,
+            },
+        )
+
+    def _market_display_label(self, market: str | None) -> str | None:
+        normalized_market = self._to_str(market)
+        if not normalized_market:
+            return None
+        return (
+            self.MARKET_DISPLAY_LABELS.get(normalized_market.casefold())
+            or normalized_market
         )
 
     async def _fetch_fxcm_time_series_payload(

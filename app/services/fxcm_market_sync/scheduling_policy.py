@@ -12,28 +12,36 @@ def normalize_asset_type(asset_type: str | None) -> str | None:
     return normalized or None
 
 
-def infer_asset_category(instrument: MarketInstrument) -> str:
-    """根据资产类型或符号推断品类，用于每日轮换策略。"""
-    asset_type = normalize_asset_type(instrument.asset_type) or ""
+def infer_category_key(asset_type: str | None, symbol: str | None = None) -> str:
+    """根据资产类型或符号推断品类键。"""
+    normalized_asset_type = normalize_asset_type(asset_type) or ""
 
-    if "digital" in asset_type or "crypto" in asset_type:
+    if "digital" in normalized_asset_type or "crypto" in normalized_asset_type:
         return "crypto"
-    if "forex" in asset_type or "fx" in asset_type or "currency" in asset_type:
+    if (
+        "forex" in normalized_asset_type
+        or "fx" in normalized_asset_type
+        or "currency" in normalized_asset_type
+    ):
         return "forex"
-    if "index" in asset_type or "stock" in asset_type or "equity" in asset_type:
+    if (
+        "index" in normalized_asset_type
+        or "stock" in normalized_asset_type
+        or "equity" in normalized_asset_type
+    ):
         return "index"
     if (
-        "metal" in asset_type
-        or "commodity" in asset_type
-        or "oil" in asset_type
-        or "energy" in asset_type
+        "metal" in normalized_asset_type
+        or "commodity" in normalized_asset_type
+        or "oil" in normalized_asset_type
+        or "energy" in normalized_asset_type
     ):
         return "commodity"
 
-    symbol = (instrument.symbol or "").upper()
-    if symbol in ("BTC/USD", "ETH/USD"):
+    normalized_symbol = (symbol or "").upper()
+    if normalized_symbol in ("BTC/USD", "ETH/USD"):
         return "crypto"
-    if symbol in (
+    if normalized_symbol in (
         "US30",
         "NAS100",
         "SPX500",
@@ -43,11 +51,20 @@ def infer_asset_category(instrument: MarketInstrument) -> str:
         "USDOLLAR",
     ):
         return "index"
-    if "XAU" in symbol or "XAG" in symbol or "OIL" in symbol:
+    if (
+        "XAU" in normalized_symbol
+        or "XAG" in normalized_symbol
+        or "OIL" in normalized_symbol
+    ):
         return "commodity"
-    if len(symbol) == 7 and "/" in symbol:
+    if len(normalized_symbol) == 7 and "/" in normalized_symbol:
         return "forex"
     return "other"
+
+
+def infer_asset_category(instrument: MarketInstrument) -> str:
+    """根据资产类型或符号推断品类，用于每日轮换策略。"""
+    return infer_category_key(instrument.asset_type, instrument.symbol)
 
 
 def is_allowed_today(instrument: MarketInstrument, current_time: datetime) -> bool:
