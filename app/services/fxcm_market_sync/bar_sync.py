@@ -103,7 +103,8 @@ class BarSyncHandler:
                 "symbol": instrument.provider_symbol,
                 "interval": state.interval,
                 "outputsize": batch_size,
-                "start_date": None,
+                # 不请求 1994 年之前的历史，避免无意义采集。
+                "start_date": BACKFILL_EARLIEST_DATE.isoformat(),
                 "end_date": state.earliest_synced_bar_time.isoformat(),
                 "price_type": state.price_type,
             }
@@ -161,27 +162,35 @@ class BarSyncHandler:
         db: AsyncSession,
         state: MarketBarSyncState,
     ) -> None:
-        """根据本地存量 K 线修正同步水位；1990 年前数据不再回补。"""
-        min_bar_time = await db.scalar(
+        """根据本地存量 K 线修正同步水位；1994 年前数据不再回补。"""
+        base_filters = (
+            MarketOHLCVBar.instrument_id == state.instrument_id,
+            MarketOHLCVBar.interval == state.interval,
+            MarketOHLCVBar.price_type == state.price_type,
+            MarketOHLCVBar.provider == PROVIDER,
+        )
+
+        # 同步水位只看 1994 及之后；更早的历史视为无效。
+        min_relevant_bar_time = await db.scalar(
             select(func.min(MarketOHLCVBar.bar_time)).where(
-                MarketOHLCVBar.instrument_id == state.instrument_id,
-                MarketOHLCVBar.interval == state.interval,
-                MarketOHLCVBar.price_type == state.price_type,
-                MarketOHLCVBar.provider == PROVIDER,
+                *base_filters,
+                MarketOHLCVBar.bar_time >= BACKFILL_EARLIEST_DATE,
             )
         )
         max_bar_time = await db.scalar(
-            select(func.max(MarketOHLCVBar.bar_time)).where(
-                MarketOHLCVBar.instrument_id == state.instrument_id,
-                MarketOHLCVBar.interval == state.interval,
-                MarketOHLCVBar.price_type == state.price_type,
-                MarketOHLCVBar.provider == PROVIDER,
+            select(func.max(MarketOHLCVBar.bar_time)).where(*base_filters)
+        )
+        # 若库里已有 1994 之前的数据，说明历史上已回补越过下限。
+        has_pre_floor_bar = await db.scalar(
+            select(func.min(MarketOHLCVBar.bar_time)).where(
+                *base_filters,
+                MarketOHLCVBar.bar_time < BACKFILL_EARLIEST_DATE,
             )
         )
 
-        if min_bar_time is not None:
+        if min_relevant_bar_time is not None:
             state.earliest_synced_bar_time = min_datetime(
-                state.earliest_synced_bar_time, min_bar_time
+                state.earliest_synced_bar_time, min_relevant_bar_time
             )
         if max_bar_time is not None:
             state.latest_synced_bar_time = max_datetime(
@@ -191,9 +200,10 @@ class BarSyncHandler:
         if state.backfill_completed:
             return
 
-        if (
-            min_bar_time is not None
-            and min_bar_time <= BACKFILL_EARLIEST_DATE
+        # 1994 之后已有数据，且已触及/越过下限 → 可转增量。
+        if min_relevant_bar_time is not None and (
+            min_relevant_bar_time <= BACKFILL_EARLIEST_DATE
+            or has_pre_floor_bar is not None
         ):
             state.backfill_completed = True
 

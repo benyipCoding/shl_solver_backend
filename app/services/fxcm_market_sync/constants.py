@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 PROVIDER = "FXCM"
 
-# 历史回补最早日期：不采集此日期之前的数据。
-BACKFILL_EARLIEST_DATE = datetime(1990, 1, 1, tzinfo=timezone.utc)
+# 历史回补最早日期：不采集此日期之前的数据；已覆盖到该日期则可转增量同步。
+BACKFILL_EARLIEST_DATE = datetime(1994, 1, 1, tzinfo=timezone.utc)
 
 SUPPORTED_INTERVALS = (
     "1min",

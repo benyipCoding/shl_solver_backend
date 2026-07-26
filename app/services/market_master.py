@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.clients import db as db_client
 from app.models.market_data import MarketInstrument, MarketOHLCVBar
+from app.services.fxcm_market_sync.constants import BACKFILL_EARLIEST_DATE
 from app.services.fxcm_sidecar import FXCMSidecarError, fxcm_sidecar_service
 from sqlalchemy import func, or_, select
 
@@ -876,13 +877,17 @@ class MarketMasterService:
             if instrument is None:
                 return None
 
+            # 1994 年之前的 K 线对前端无意义，统一过滤。
+            effective_start = BACKFILL_EARLIEST_DATE
+            if start_dt is not None and start_dt > BACKFILL_EARLIEST_DATE:
+                effective_start = start_dt
+
             bar_stmt = select(MarketOHLCVBar).where(
                 MarketOHLCVBar.instrument_id == instrument.id,
                 MarketOHLCVBar.interval == requested_interval,
                 MarketOHLCVBar.price_type == "mid",
+                MarketOHLCVBar.bar_time >= effective_start,
             )
-            if start_dt is not None:
-                bar_stmt = bar_stmt.where(MarketOHLCVBar.bar_time >= start_dt)
             if end_dt is not None:
                 bar_stmt = bar_stmt.where(MarketOHLCVBar.bar_time < end_dt)
 
