@@ -69,9 +69,7 @@ def resolve_database_urls(
     target_url: str | None,
 ) -> tuple[str, str]:
     resolved_source = (
-        source_url
-        or os.getenv("DATABASE_URL_SYNC")
-        or os.getenv("database_url_sync")
+        source_url or os.getenv("DATABASE_URL_SYNC") or os.getenv("database_url_sync")
     )
     resolved_target = (
         target_url
