@@ -230,12 +230,8 @@ class FXCMMarketSyncService:
                 f"Unsupported interval: {interval}",
             )
 
-        canonical_symbol = market_master_service._resolve_fxcm_symbol(
-            normalized_symbol
-        )
-        job = self._enqueue_priority_forward_sync(
-            canonical_symbol, normalized_interval
-        )
+        canonical_symbol = market_master_service._resolve_fxcm_symbol(normalized_symbol)
+        job = self._enqueue_priority_forward_sync(canonical_symbol, normalized_interval)
         logger.info(
             "Priority forward sync starting immediately",
             extra={
@@ -445,9 +441,7 @@ class FXCMMarketSyncService:
             dummy = FXCMMarketSyncResult(reason="priority-preempt")
             await self._drain_priority_jobs(db, dummy)
 
-        return await instrument_sync_handler.sync_instruments(
-            db, before_each=preempt
-        )
+        return await instrument_sync_handler.sync_instruments(db, before_each=preempt)
 
     async def bootstrap_sync_states(self, db: AsyncSession) -> int:
         return await state_sync_handler.bootstrap_sync_states(

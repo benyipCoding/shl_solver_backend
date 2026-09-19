@@ -11,6 +11,9 @@ from app.models.token_record import TokenRecord
 from app.models.shl_solver import SHLSolverHistory
 from app.models.ai_task import AITask
 from app.models.market_data import (
+    MarketBacktestEvent,
+    MarketBacktestSession,
+    MarketBacktestTrade,
     MarketBarSyncState,
     MarketInstrument,
     MarketInstrumentAlias,
