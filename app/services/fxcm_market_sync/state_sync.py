@@ -1,5 +1,7 @@
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,9 +97,14 @@ class StateSyncHandler:
         *,
         result: FXCMMarketSyncResult,
         force_due: bool,
+        before_batch: (
+            Callable[[AsyncSession, FXCMMarketSyncResult], Awaitable[Any]] | None
+        ) = None,
     ) -> int:
         """挑选到期状态并逐个执行同步，记录成功失败统计。"""
         now = utc_now()
+        if before_batch is not None:
+            await before_batch(db, result)
         bar_count_subquery = (
             select(
                 MarketOHLCVBar.instrument_id.label("instrument_id"),
@@ -150,6 +157,9 @@ class StateSyncHandler:
 
         processed = 0
         for state, instrument in rows:
+            if before_batch is not None:
+                await before_batch(db, result)
+
             processed += 1
             state_id = state.id
             instrument_id = state.instrument_id

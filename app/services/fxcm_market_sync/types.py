@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -37,3 +38,22 @@ class FXCMMarketSyncResult:
             "errors": list(self.errors),
             "finished_at": self.finished_at,
         }
+
+
+class PriorityForwardSyncError(Exception):
+    """手动优先追赶同步的业务错误，携带 HTTP 状态码。"""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+@dataclass
+class PriorityForwardSyncJob:
+    """最高优先级的向前追赶任务：只补最新缺口，不回补更早历史。"""
+
+    symbol: str
+    interval: str
+    future: asyncio.Future
+    requested_at: datetime = field(default_factory=utc_now)

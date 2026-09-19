@@ -46,6 +46,19 @@ def incremental_outputsize(interval: str) -> int:
     return settings.fxcm_sync_1h_incremental_outputsize
 
 
+def catchup_outputsize(interval: str) -> int:
+    """手动追赶到最新时，单次向前拉取的条数。只覆盖最新缺口，不回补更早历史。"""
+    if interval == "1week":
+        return 80
+    if interval == "1day":
+        return max(400, settings.fxcm_sync_1day_incremental_outputsize)
+    if interval in {"8h", "4h"}:
+        return 600
+    if interval in {"2h", "1h"}:
+        return 1000
+    return 2000
+
+
 def state_priority(interval: str, sync_intervals: list[str]) -> int:
     """根据周期在配置中的顺序计算任务优先级。"""
     try:

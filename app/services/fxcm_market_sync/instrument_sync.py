@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any, Mapping, Sequence
 
 from sqlalchemy import and_, or_, select
@@ -40,11 +41,18 @@ class InstrumentSyncHandler:
             canonical_symbols.append(canonical_symbol)
         return canonical_symbols
 
-    async def sync_instruments(self, db: AsyncSession) -> int:
+    async def sync_instruments(
+        self,
+        db: AsyncSession,
+        *,
+        before_each: Callable[[], Awaitable[Any]] | None = None,
+    ) -> int:
         """刷新热池品种元数据并同步别名映射。"""
         synced_count = 0
         hot_symbols = await self.get_hot_symbols(db)
         for symbol in hot_symbols:
+            if before_each is not None:
+                await before_each()
             instrument_payload = await self.build_instrument_payload(
                 symbol, hot_symbols=hot_symbols
             )

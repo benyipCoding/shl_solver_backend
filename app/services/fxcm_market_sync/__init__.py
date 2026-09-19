@@ -1,7 +1,7 @@
 """FXCM 行情同步包。
 
 模块划分：
-- service: 编排入口（run_cycle / run_manual / 监控接口）
+- service: 编排入口（run_cycle / run_manual / 优先追赶 / 监控接口）
 - scheduler: 后台定时调度循环
 - instrument_sync: 品种元数据与别名同步
 - bar_sync: K 线拉取、转换与落库

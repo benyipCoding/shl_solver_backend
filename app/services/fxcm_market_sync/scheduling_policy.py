@@ -84,9 +84,9 @@ def is_allowed_today(instrument: MarketInstrument, current_time: datetime) -> bo
     if weekday == 3:
         return category == "index"
     if weekday == 4:
-        return category == "forex"
-    if weekday == 5:
         return category == "crypto"
+    if weekday == 5:
+        return category == "forex"
     if weekday == 6:
         return category == "commodity"
 

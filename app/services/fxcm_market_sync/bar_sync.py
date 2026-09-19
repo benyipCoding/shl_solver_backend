@@ -10,10 +10,12 @@ from app.models.market_data import MarketBarSyncState, MarketInstrument, MarketO
 from app.services.fxcm_market_sync.constants import (
     ALWAYS_OPEN_ASSET_TYPES,
     BACKFILL_EARLIEST_DATE,
+    PRIORITY_FORWARD_MAX_ROUNDS,
     PROVIDER,
 )
 from app.services.fxcm_market_sync.intervals import (
     calculate_next_sync_from,
+    catchup_outputsize,
     incremental_outputsize,
     interval_delta,
 )
@@ -47,51 +49,22 @@ class BarSyncHandler:
 
         await self._hydrate_state_from_storage(db, state)
 
-        inserted_count = 0
-
-        forward_payload = {
-            "symbol": instrument.provider_symbol,
-            "interval": state.interval,
-            "outputsize": incremental_outputsize(state.interval),
-            "start_date": None,
-            "end_date": None,
-            "price_type": state.price_type,
-        }
-
-        if state.latest_synced_bar_time is not None:
-            overlap = interval_delta(state.interval) * max(
-                1, settings.fxcm_sync_incremental_overlap_bars
-            )
-            incremental_start = state.latest_synced_bar_time - overlap
-            forward_payload["start_date"] = incremental_start.isoformat()
-
-        payload = await fxcm_sidecar_service.get_history(**forward_payload)
-        values = payload.get("values") if isinstance(payload, Mapping) else []
-        rows = self.build_bar_rows(
-            instrument=instrument,
-            state=state,
-            values=values if isinstance(values, list) else [],
-            meta=payload.get("meta") if isinstance(payload, Mapping) else None,
+        inserted_count = await self._pull_forward_bars(
+            db,
+            state,
+            instrument,
+            outputsize=incremental_outputsize(state.interval),
+            start_date=(
+                (
+                    state.latest_synced_bar_time
+                    - interval_delta(state.interval)
+                    * max(1, settings.fxcm_sync_incremental_overlap_bars)
+                ).isoformat()
+                if state.latest_synced_bar_time is not None
+                else None
+            ),
+            end_date=None,
         )
-
-        if rows:
-            inserted = await self.upsert_bars(db, rows)
-            inserted_count += inserted
-            bar_times = [row["bar_time"] for row in rows]
-
-            state.earliest_synced_bar_time = min_datetime(
-                state.earliest_synced_bar_time, min(bar_times)
-            )
-            state.latest_synced_bar_time = max_datetime(
-                state.latest_synced_bar_time, max(bar_times)
-            )
-
-            state.last_requested_start_at = parse_request_payload_datetime(
-                forward_payload.get("start_date")
-            )
-            state.last_requested_end_at = parse_request_payload_datetime(
-                forward_payload.get("end_date")
-            )
 
         if (
             state.earliest_synced_bar_time is not None
@@ -139,6 +112,122 @@ class BarSyncHandler:
         ):
             state.backfill_completed = True
 
+        self._finalize_state_success(state, instrument)
+        return inserted_count
+
+    async def sync_forward_only(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+    ) -> int:
+        """只把本地最新 K 线追赶到当前时间，不回补更早的历史缺口。"""
+        state.last_attempt_at = utc_now()
+        state.last_status = "RUNNING"
+        state.last_error = None
+
+        await self._hydrate_state_from_storage(db, state)
+
+        inserted_count = 0
+        outputsize = catchup_outputsize(state.interval)
+        delta = interval_delta(state.interval)
+        overlap = delta * max(1, settings.fxcm_sync_incremental_overlap_bars)
+
+        if state.latest_synced_bar_time is None:
+            inserted_count += await self._pull_forward_bars(
+                db,
+                state,
+                instrument,
+                outputsize=outputsize,
+                start_date=None,
+                end_date=None,
+            )
+        else:
+            now = utc_now()
+            for _ in range(PRIORITY_FORWARD_MAX_ROUNDS):
+                latest = state.latest_synced_bar_time
+                if latest is None:
+                    break
+                if latest >= now - delta:
+                    break
+
+                window_start = latest - overlap
+                window_end = min(now, window_start + delta * outputsize)
+                if window_end <= window_start:
+                    break
+
+                previous_latest = latest
+                inserted = await self._pull_forward_bars(
+                    db,
+                    state,
+                    instrument,
+                    outputsize=outputsize,
+                    start_date=window_start.isoformat(),
+                    end_date=window_end.isoformat(),
+                )
+                inserted_count += inserted
+
+                if (
+                    state.latest_synced_bar_time is None
+                    or state.latest_synced_bar_time <= previous_latest
+                ):
+                    break
+
+                now = utc_now()
+
+        self._finalize_state_success(state, instrument)
+        return inserted_count
+
+    async def _pull_forward_bars(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+        *,
+        outputsize: int,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> int:
+        """按给定窗口向前拉取并落库 K 线，更新同步水位。"""
+        forward_payload = {
+            "symbol": instrument.provider_symbol,
+            "interval": state.interval,
+            "outputsize": outputsize,
+            "start_date": start_date,
+            "end_date": end_date,
+            "price_type": state.price_type,
+        }
+        payload = await fxcm_sidecar_service.get_history(**forward_payload)
+        values = payload.get("values") if isinstance(payload, Mapping) else []
+        rows = self.build_bar_rows(
+            instrument=instrument,
+            state=state,
+            values=values if isinstance(values, list) else [],
+            meta=payload.get("meta") if isinstance(payload, Mapping) else None,
+        )
+        if not rows:
+            state.last_requested_start_at = parse_request_payload_datetime(start_date)
+            state.last_requested_end_at = parse_request_payload_datetime(end_date)
+            return 0
+
+        inserted = await self.upsert_bars(db, rows)
+        bar_times = [row["bar_time"] for row in rows]
+        state.earliest_synced_bar_time = min_datetime(
+            state.earliest_synced_bar_time, min(bar_times)
+        )
+        state.latest_synced_bar_time = max_datetime(
+            state.latest_synced_bar_time, max(bar_times)
+        )
+        state.last_requested_start_at = parse_request_payload_datetime(start_date)
+        state.last_requested_end_at = parse_request_payload_datetime(end_date)
+        return inserted
+
+    def _finalize_state_success(
+        self,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+    ) -> None:
+        """将状态机标为成功，并按是否已完成历史回补设置下次调度时间。"""
         state.last_success_at = utc_now()
         state.last_status = "SUCCESS"
         state.retry_count = 0
@@ -155,7 +244,6 @@ class BarSyncHandler:
             state.next_sync_from = utc_now() + timedelta(seconds=120)
 
         state.updated_at = utc_now()
-        return inserted_count
 
     async def _hydrate_state_from_storage(
         self,

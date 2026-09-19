@@ -4,9 +4,10 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
 
 from app.clients import db as db_client
-from app.depends.jwt_guard import verify_user
+from app.depends.jwt_guard import verify_superuser
 from app.schemas.response import APIResponse
 from app.services.fxcm_market_sync import fxcm_market_sync_service
+from app.services.fxcm_market_sync.types import PriorityForwardSyncError
 from app.services.market_master import TwelveDataAPIError, market_master_service
 
 
@@ -328,6 +329,54 @@ async def get_sync_status():
                 "rotation": sync_states["rotation"],
             }
         )
+
+
+@router.post(
+    "/sync/latest",
+    response_model=APIResponse[Any],
+    summary="优先同步当前品种当前周期到最新日期",
+    description=(
+        "仅超级管理员可用。将指定交易品种、周期插入最高优先级队列，"
+        "只从本地已有的最新 K 线向前追赶到当前日期，不回补更早的历史缺口。"
+        "该任务优先于后台定时抓取。"
+    ),
+    dependencies=[Depends(verify_superuser)],
+)
+async def sync_latest_bars(
+    symbol: str = Query(..., min_length=1, description="交易品种。示例: GBP/USD。"),
+    interval: str = Query(
+        ...,
+        min_length=1,
+        description="K 线周期。示例: 1day、D1、1h、H1。",
+    ),
+):
+    try:
+        async with db_client.async_session() as db:
+            result = await fxcm_market_sync_service.request_priority_forward_sync(
+                db,
+                symbol=symbol,
+                interval=interval,
+            )
+    except PriorityForwardSyncError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "code": exc.status_code,
+                "message": exc.message,
+                "data": None,
+            },
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": 500,
+                "message": f"{type(exc).__name__}: {exc}",
+                "data": None,
+            },
+        )
+
+    return APIResponse(data=result)
 
 
 @router.get(
