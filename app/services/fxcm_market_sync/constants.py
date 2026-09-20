@@ -21,4 +21,10 @@ SUPPORTED_INTERVALS = (
 # 手动追赶到最新时，单次向前分页的上限轮数。
 PRIORITY_FORWARD_MAX_ROUNDS = 20
 
+# 框选修复时，按时间窗口分页拉取的上限轮数。
+PRIORITY_REPAIR_MAX_ROUNDS = 120
+
+# 框选修复单次 UPSERT / DELETE 的批大小。
+REPAIR_DB_CHUNK_SIZE = 1000
+
 ALWAYS_OPEN_ASSET_TYPES = {"digital currency"}

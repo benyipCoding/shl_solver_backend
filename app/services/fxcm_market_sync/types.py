@@ -41,7 +41,7 @@ class FXCMMarketSyncResult:
 
 
 class PriorityForwardSyncError(Exception):
-    """手动优先追赶同步的业务错误，携带 HTTP 状态码。"""
+    """手动优先同步（追赶 / 框选修复）的业务错误，携带 HTTP 状态码。"""
 
     def __init__(self, status_code: int, message: str) -> None:
         super().__init__(message)
@@ -50,10 +50,17 @@ class PriorityForwardSyncError(Exception):
 
 
 @dataclass
-class PriorityForwardSyncJob:
-    """最高优先级的向前追赶任务：只补最新缺口，不回补更早历史。"""
+class PrioritySyncJob:
+    """最高优先级同步任务：向前追赶，或按时间段修复已有 K 线。"""
 
     symbol: str
     interval: str
     future: asyncio.Future
     requested_at: datetime = field(default_factory=utc_now)
+    kind: str = "forward"
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+
+# 兼容旧名称，避免外部 import 断裂。
+PriorityForwardSyncJob = PrioritySyncJob

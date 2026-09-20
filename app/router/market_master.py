@@ -412,6 +412,66 @@ async def sync_latest_bars(
     return APIResponse(data=result)
 
 
+@router.post(
+    "/sync/repair",
+    response_model=APIResponse[Any],
+    summary="优先重采框选时间段的 K 线并覆盖差异",
+    description=(
+        "仅超级管理员可用。按指定交易品种、周期和时间段立即向 FXCM sidecar 重新采集，"
+        "该任务插入最高优先级队列，无需等待后台定时任务完成。"
+        "若新数据与本地存在差异（缺漏、OHLCV 不同、多余脏数据），以新数据为准。"
+    ),
+    dependencies=[Depends(verify_superuser)],
+)
+async def repair_bars(
+    symbol: str = Query(..., min_length=1, description="交易品种。示例: XAU/USD。"),
+    interval: str = Query(
+        ...,
+        min_length=1,
+        description="K 线周期。示例: 5min、M5、1h、H1。",
+    ),
+    start_date: str = Query(
+        ...,
+        min_length=1,
+        description="框选开始时间，ISO 日期或日期时间。示例: 2026-07-01T00:00:00Z。",
+    ),
+    end_date: str = Query(
+        ...,
+        min_length=1,
+        description="框选结束时间，ISO 日期或日期时间。示例: 2026-08-31T23:59:59Z。",
+    ),
+):
+    try:
+        async with db_client.async_session() as db:
+            result = await fxcm_market_sync_service.request_priority_range_repair(
+                db,
+                symbol=symbol,
+                interval=interval,
+                start_date=start_date,
+                end_date=end_date,
+            )
+    except PriorityForwardSyncError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "code": exc.status_code,
+                "message": exc.message,
+                "data": None,
+            },
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": 500,
+                "message": f"{type(exc).__name__}: {exc}",
+                "data": None,
+            },
+        )
+
+    return APIResponse(data=result)
+
+
 @router.get(
     "/market-movers/{market}",
     response_model=APIResponse[Any],

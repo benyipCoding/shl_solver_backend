@@ -10,7 +10,10 @@ Typical workflow (local machine with SSH tunnel to prod PG):
   # 2) Scheduled incremental push (Task Scheduler every 5-15 min)
   python scripts/sync_market_to_prod.py incremental
 
-  # 3) Inspect local vs remote counts
+  # 3) After repairing historical bars locally, push that range to prod
+  python scripts/sync_market_to_prod.py repair --symbol "XAU/USD" --interval 5min --start-date 2026-07-01 --end-date 2026-08-31
+
+  # 4) Inspect local vs remote counts
   python scripts/sync_market_to_prod.py status
 
 Environment (.env):
@@ -96,10 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "mode",
-        choices=("bootstrap", "incremental", "metadata", "bars", "status"),
+        choices=("bootstrap", "incremental", "metadata", "bars", "repair", "status"),
         help=(
-            "bootstrap=one-time full copy; incremental=metadata+bars; "
-            "metadata=instruments+aliases only; bars=OHLCV only; status=counts"
+            "bootstrap=one-time full copy; incremental=metadata+new bars after remote watermark; "
+            "metadata=instruments+aliases only; bars=OHLCV only after watermark; "
+            "repair=push a historical symbol/interval/time range and delete remote extras; "
+            "status=counts"
         ),
     )
     parser.add_argument(
@@ -128,6 +133,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="bootstrap only: truncate remote market tables before copy",
+    )
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        help="repair only: instrument symbol, e.g. XAU/USD",
+    )
+    parser.add_argument(
+        "--interval",
+        default=None,
+        help="repair only: bar interval, e.g. 5min or M5",
+    )
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="repair only: range start ISO datetime, e.g. 2026-07-01 or 2026-07-01T00:00:00Z",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="repair only: range end ISO datetime, e.g. 2026-08-31 or 2026-08-31T23:59:59Z",
     )
     parser.add_argument(
         "--json",
@@ -184,6 +209,27 @@ def main() -> int:
             result = service.run_bootstrap(force=args.force)
         elif args.mode == "incremental":
             result = service.run_incremental()
+        elif args.mode == "repair":
+            missing = [
+                name
+                for name, value in (
+                    ("--symbol", args.symbol),
+                    ("--interval", args.interval),
+                    ("--start-date", args.start_date),
+                    ("--end-date", args.end_date),
+                )
+                if not value
+            ]
+            if missing:
+                raise SystemExit(
+                    "repair mode requires " + ", ".join(missing)
+                )
+            result = service.run_range_repair(
+                symbol=args.symbol,
+                interval=args.interval,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
         elif args.mode == "metadata":
             from app.services.market_data_replica.types import MarketReplicaResult
 
@@ -214,6 +260,11 @@ def main() -> int:
                 f"mode={result.mode} skipped={result.skipped} "
                 f"instruments={result.instruments_upserted} "
                 f"aliases={result.aliases_upserted} bars={result.bars_upserted}"
+                + (
+                    f" deleted={result.bars_deleted}"
+                    if result.mode == "repair"
+                    else ""
+                )
             )
             if result.errors:
                 for error in result.errors:

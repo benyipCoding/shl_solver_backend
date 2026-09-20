@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -17,8 +17,13 @@ from app.models.market_data import (
     MarketOHLCVBar,
 )
 from app.services.fxcm_market_sync.constants import PROVIDER
-from app.services.fxcm_market_sync.intervals import interval_delta
+from app.services.fxcm_market_sync.intervals import interval_delta, normalize_sync_interval
+from app.services.fxcm_market_sync.utils import (
+    normalize_symbol,
+    parse_request_payload_datetime,
+)
 from app.services.market_data_replica.types import MarketReplicaResult
+from app.services.market_master import market_master_service
 
 
 logger = logging.getLogger(__name__)
@@ -83,6 +88,12 @@ _BAR_UPSERT_COLUMNS = (
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _model_row_dict(instance: object) -> dict[str, Any]:
@@ -310,6 +321,156 @@ class MarketDataReplicaService:
 
             target.commit()
         return total
+
+    def run_range_repair(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_date: str,
+        end_date: str,
+        price_type: str = "mid",
+    ) -> MarketReplicaResult:
+        """把本地已修复的历史 K 线按时间段覆盖到远程，并删除远程多余脏数据。"""
+        result = MarketReplicaResult(mode="repair")
+        try:
+            upserted, deleted = self.sync_bars_range_repair(
+                symbol=symbol,
+                interval=interval,
+                start_date=start_date,
+                end_date=end_date,
+                price_type=price_type,
+            )
+            result.bars_upserted = upserted
+            result.bars_deleted = deleted
+        except Exception as exc:
+            logger.exception("Market data range repair replica failed")
+            result.errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            result.finished_at = _utc_now()
+        return result
+
+    def sync_bars_range_repair(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        start_date: str,
+        end_date: str,
+        price_type: str = "mid",
+    ) -> tuple[int, int]:
+        """按品种/周期/时间段把本地 K 线 upsert 到远程，并以本地为源删除远程多余 K 线。"""
+        normalized_interval = normalize_sync_interval(interval)
+        if normalized_interval is None:
+            raise ValueError(f"Unsupported interval: {interval}")
+
+        start_at = parse_request_payload_datetime(start_date)
+        end_at = parse_request_payload_datetime(end_date)
+        if start_at is None or end_at is None:
+            raise ValueError("start_date and end_date are required ISO datetimes")
+        if end_at < start_at:
+            start_at, end_at = end_at, start_at
+
+        canonical_symbol = market_master_service._resolve_fxcm_symbol(symbol)
+        lookup = normalize_symbol(canonical_symbol)
+        normalized_price_type = (price_type or "mid").strip().lower() or "mid"
+
+        with self._source_session() as source, self._target_session() as target:
+            source_instrument = source.scalars(
+                select(MarketInstrument).where(
+                    MarketInstrument.provider == PROVIDER,
+                    or_(
+                        MarketInstrument.normalized_symbol == lookup,
+                        MarketInstrument.normalized_provider_symbol == lookup,
+                    ),
+                )
+            ).first()
+            if source_instrument is None:
+                raise ValueError(f"Instrument not found in source: {symbol}")
+
+            target_instrument_id = target.scalar(
+                select(MarketInstrument.id).where(
+                    MarketInstrument.provider == PROVIDER,
+                    MarketInstrument.normalized_symbol
+                    == source_instrument.normalized_symbol,
+                )
+            )
+            if target_instrument_id is None:
+                raise ValueError(
+                    f"Instrument not found in target: {source_instrument.symbol}"
+                )
+
+            local_rows = source.scalars(
+                select(MarketOHLCVBar)
+                .where(
+                    MarketOHLCVBar.instrument_id == source_instrument.id,
+                    MarketOHLCVBar.interval == normalized_interval,
+                    MarketOHLCVBar.price_type == normalized_price_type,
+                    MarketOHLCVBar.provider == PROVIDER,
+                    MarketOHLCVBar.bar_time >= start_at,
+                    MarketOHLCVBar.bar_time <= end_at,
+                )
+                .order_by(MarketOHLCVBar.bar_time.asc())
+            ).all()
+            if not local_rows:
+                raise ValueError(
+                    "Local range has no bars; refuse to wipe remote data"
+                )
+
+            upserted = 0
+            local_times = {_as_utc(row.bar_time) for row in local_rows}
+            for offset in range(0, len(local_rows), self._batch_size):
+                chunk = local_rows[offset : offset + self._batch_size]
+                payloads = []
+                for row in chunk:
+                    payload = _model_row_dict(row)
+                    payload.pop("id", None)
+                    payload["instrument_id"] = int(target_instrument_id)
+                    payload["updated_at"] = _utc_now()
+                    payloads.append(payload)
+                upserted += self._upsert_bars(target, payloads)
+
+            remote_times = {
+                _as_utc(bar_time)
+                for bar_time in target.scalars(
+                    select(MarketOHLCVBar.bar_time).where(
+                        MarketOHLCVBar.instrument_id == int(target_instrument_id),
+                        MarketOHLCVBar.interval == normalized_interval,
+                        MarketOHLCVBar.price_type == normalized_price_type,
+                        MarketOHLCVBar.provider == PROVIDER,
+                        MarketOHLCVBar.bar_time >= start_at,
+                        MarketOHLCVBar.bar_time <= end_at,
+                    )
+                ).all()
+            }
+            stale_times = [bar_time for bar_time in remote_times if bar_time not in local_times]
+            deleted = 0
+            for offset in range(0, len(stale_times), self._batch_size):
+                chunk = stale_times[offset : offset + self._batch_size]
+                result = target.execute(
+                    delete(MarketOHLCVBar).where(
+                        MarketOHLCVBar.instrument_id == int(target_instrument_id),
+                        MarketOHLCVBar.interval == normalized_interval,
+                        MarketOHLCVBar.price_type == normalized_price_type,
+                        MarketOHLCVBar.provider == PROVIDER,
+                        MarketOHLCVBar.bar_time.in_(chunk),
+                    )
+                )
+                deleted += int(result.rowcount or 0)
+
+            target.commit()
+            logger.info(
+                "Range repair replica finished",
+                extra={
+                    "symbol": source_instrument.symbol,
+                    "interval": normalized_interval,
+                    "start_at": start_at.isoformat(),
+                    "end_at": end_at.isoformat(),
+                    "upserted": upserted,
+                    "deleted": deleted,
+                },
+            )
+            return upserted, deleted
 
     def _source_session(self) -> Session:
         return self._source_session_factory()

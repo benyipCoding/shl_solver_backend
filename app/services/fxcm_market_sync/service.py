@@ -15,11 +15,35 @@ from app.models.market_data import (
     MarketOHLCVBar,
 )
 from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
-from app.services.fxcm_market_sync.constants import PROVIDER, SUPPORTED_INTERVALS
+import asyncio
+import logging
+import math
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Any
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.models.market_data import (
+    MarketBarSyncState,
+    MarketInstrument,
+    MarketInstrumentAlias,
+    MarketOHLCVBar,
+)
+from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
+from app.services.fxcm_market_sync.constants import (
+    PRIORITY_REPAIR_MAX_ROUNDS,
+    PROVIDER,
+    SUPPORTED_INTERVALS,
+)
 from app.services.fxcm_market_sync.instrument_sync import instrument_sync_handler
 from app.services.fxcm_market_sync.intervals import (
     calculate_next_sync_from,
+    interval_delta,
     normalize_sync_interval,
+    repair_outputsize,
     resolve_sync_intervals,
 )
 from app.services.fxcm_market_sync.scheduling_policy import (
@@ -30,10 +54,15 @@ from app.services.fxcm_market_sync.state_sync import state_sync_handler
 from app.services.fxcm_market_sync.types import (
     FXCMMarketSyncResult,
     PriorityForwardSyncError,
-    PriorityForwardSyncJob,
+    PrioritySyncJob,
     utc_now,
 )
-from app.services.fxcm_market_sync.utils import normalize_symbol
+from app.services.fxcm_market_sync.utils import (
+    normalize_symbol,
+    parse_request_payload_datetime,
+)
+from app.services.fxcm_sidecar import FXCMSidecarError
+from app.services.market_master import market_master_service
 from app.services.market_master import market_master_service
 
 
@@ -51,7 +80,7 @@ class FXCMMarketSyncService:
         self._lock = asyncio.Lock()
         self._priority_run_lock = asyncio.Lock()
         self._last_metadata_sync_at: datetime | None = None
-        self._priority_jobs: deque[PriorityForwardSyncJob] = deque()
+        self._priority_jobs: deque[PrioritySyncJob] = deque()
 
     # --- 配置与状态查询 ---
 
@@ -231,7 +260,11 @@ class FXCMMarketSyncService:
             )
 
         canonical_symbol = market_master_service._resolve_fxcm_symbol(normalized_symbol)
-        job = self._enqueue_priority_forward_sync(canonical_symbol, normalized_interval)
+        job = self._enqueue_priority_job(
+            canonical_symbol,
+            normalized_interval,
+            kind="forward",
+        )
         logger.info(
             "Priority forward sync starting immediately",
             extra={
@@ -242,27 +275,122 @@ class FXCMMarketSyncService:
         )
         return await self._run_priority_job(db, job)
 
+    async def request_priority_range_repair(
+        self,
+        db: AsyncSession,
+        symbol: str,
+        interval: str,
+        start_date: str,
+        end_date: str,
+    ) -> dict[str, Any]:
+        """立刻按时间段重采指定品种/周期，差异以 FXCM 新数据为准，并插到最高优先级。"""
+        normalized_symbol = (symbol or "").strip()
+        if not normalized_symbol:
+            raise PriorityForwardSyncError(400, "symbol is required")
+
+        normalized_interval = self._normalize_sync_interval(interval)
+        if normalized_interval is None:
+            raise PriorityForwardSyncError(
+                400,
+                f"Unsupported interval: {interval}",
+            )
+
+        start_at = parse_request_payload_datetime(start_date)
+        end_at = parse_request_payload_datetime(end_date)
+        if start_at is None or end_at is None:
+            raise PriorityForwardSyncError(
+                400,
+                "start_date and end_date are required ISO datetimes",
+            )
+        if end_at < start_at:
+            start_at, end_at = end_at, start_at
+        if start_at == end_at:
+            end_at = start_at + interval_delta(normalized_interval)
+
+        estimated_windows = self._estimate_repair_windows(
+            normalized_interval, start_at, end_at
+        )
+        if estimated_windows > PRIORITY_REPAIR_MAX_ROUNDS:
+            raise PriorityForwardSyncError(
+                400,
+                "框选时间范围过大，请缩小后再修复",
+            )
+
+        canonical_symbol = market_master_service._resolve_fxcm_symbol(normalized_symbol)
+        job = self._enqueue_priority_job(
+            canonical_symbol,
+            normalized_interval,
+            kind="repair",
+            start_at=start_at,
+            end_at=end_at,
+        )
+        logger.info(
+            "Priority range repair starting immediately",
+            extra={
+                "symbol": canonical_symbol,
+                "interval": normalized_interval,
+                "start_at": start_at.isoformat(),
+                "end_at": end_at.isoformat(),
+                "estimated_windows": estimated_windows,
+                "scheduler_lock_held": self._lock.locked(),
+            },
+        )
+        return await self._run_priority_job(db, job)
+
+    def _estimate_repair_windows(
+        self,
+        interval: str,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> int:
+        window = interval_delta(interval) * max(1, repair_outputsize(interval))
+        window_seconds = max(window.total_seconds(), 1)
+        span_seconds = max((end_at - start_at).total_seconds(), 0)
+        return max(1, math.ceil(span_seconds / window_seconds))
+
+    def _enqueue_priority_job(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        kind: str = "forward",
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+    ) -> PrioritySyncJob:
+        """合并同一任务的在途优先请求；修复任务插入队列最前。"""
+        for existing in self._priority_jobs:
+            if existing.future.done():
+                continue
+            if existing.kind != kind:
+                continue
+            if existing.symbol != symbol or existing.interval != interval:
+                continue
+            if kind == "repair" and (
+                existing.start_at != start_at or existing.end_at != end_at
+            ):
+                continue
+            return existing
+
+        job = PrioritySyncJob(
+            symbol=symbol,
+            interval=interval,
+            kind=kind,
+            start_at=start_at,
+            end_at=end_at,
+            future=asyncio.get_running_loop().create_future(),
+        )
+        if kind == "repair":
+            self._priority_jobs.appendleft(job)
+        else:
+            self._priority_jobs.append(job)
+        return job
+
     def _enqueue_priority_forward_sync(
         self,
         symbol: str,
         interval: str,
-    ) -> PriorityForwardSyncJob:
-        """合并同一品种/周期的在途优先任务，避免重复抓取。"""
-        for existing in self._priority_jobs:
-            if (
-                existing.symbol == symbol
-                and existing.interval == interval
-                and not existing.future.done()
-            ):
-                return existing
-
-        job = PriorityForwardSyncJob(
-            symbol=symbol,
-            interval=interval,
-            future=asyncio.get_running_loop().create_future(),
-        )
-        self._priority_jobs.append(job)
-        return job
+    ) -> PrioritySyncJob:
+        return self._enqueue_priority_job(symbol, interval, kind="forward")
 
     async def _drain_priority_jobs(
         self,
@@ -294,9 +422,9 @@ class FXCMMarketSyncService:
     async def _run_priority_job(
         self,
         db: AsyncSession,
-        job: PriorityForwardSyncJob,
+        job: PrioritySyncJob,
     ) -> dict[str, Any]:
-        """执行优先追赶任务；不占用后台调度锁，避免被 metadata 周期堵住。"""
+        """执行优先任务；不占用后台调度锁，避免被 metadata 周期堵住。"""
         async with self._priority_run_lock:
             if job.future.done():
                 return job.future.result()
@@ -308,24 +436,50 @@ class FXCMMarketSyncService:
 
             try:
                 async with db.begin_nested():
-                    payload = await self._execute_priority_forward_sync(db, job)
+                    payload = await self._execute_priority_job(db, job)
                 await db.commit()
                 if not job.future.done():
                     job.future.set_result(payload)
                 return payload
+            except FXCMSidecarError as exc:
+                wrapped = PriorityForwardSyncError(exc.status_code, exc.message)
+                logger.exception(
+                    "Priority sync job failed via sidecar",
+                    extra={
+                        "symbol": job.symbol,
+                        "interval": job.interval,
+                        "kind": job.kind,
+                    },
+                )
+                if not job.future.done():
+                    job.future.set_exception(wrapped)
+                raise wrapped from exc
             except Exception as exc:
                 logger.exception(
-                    "Priority forward sync failed",
-                    extra={"symbol": job.symbol, "interval": job.interval},
+                    "Priority sync job failed",
+                    extra={
+                        "symbol": job.symbol,
+                        "interval": job.interval,
+                        "kind": job.kind,
+                    },
                 )
                 if not job.future.done():
                     job.future.set_exception(exc)
                 raise
 
+    async def _execute_priority_job(
+        self,
+        db: AsyncSession,
+        job: PrioritySyncJob,
+    ) -> dict[str, Any]:
+        if job.kind == "repair":
+            return await self._execute_priority_range_repair(db, job)
+        return await self._execute_priority_forward_sync(db, job)
+
     async def _execute_priority_forward_sync(
         self,
         db: AsyncSession,
-        job: PriorityForwardSyncJob,
+        job: PrioritySyncJob,
     ) -> dict[str, Any]:
         """执行单次向前追赶：从本地最新 K 线补到当前时间。"""
         instrument = await self._ensure_instrument(db, job.symbol)
@@ -349,6 +503,47 @@ class FXCMMarketSyncService:
             "from_bar_time": from_bar_time,
             "to_bar_time": state.latest_synced_bar_time,
             "backfill_skipped": True,
+        }
+
+    async def _execute_priority_range_repair(
+        self,
+        db: AsyncSession,
+        job: PrioritySyncJob,
+    ) -> dict[str, Any]:
+        """按框选时间段重采 FXCM，并以新数据覆盖差异。"""
+        if job.start_at is None or job.end_at is None:
+            raise PriorityForwardSyncError(400, "repair range is required")
+
+        instrument = await self._ensure_instrument(db, job.symbol)
+        if instrument is None:
+            raise PriorityForwardSyncError(
+                404,
+                f"Instrument not found: {job.symbol}",
+            )
+
+        state = await self._ensure_bar_state(db, instrument, job.interval)
+        await db.flush()
+        result = await bar_sync_handler.sync_range_repair(
+            db,
+            state,
+            instrument,
+            start_at=job.start_at,
+            end_at=job.end_at,
+        )
+        if not result.get("ok"):
+            raise PriorityForwardSyncError(
+                502,
+                "福汇未返回该时间段的 K 线，已取消覆盖以免误删本地数据",
+            )
+        return {
+            "ok": True,
+            "kind": "repair",
+            "symbol": instrument.symbol,
+            "provider_symbol": instrument.provider_symbol,
+            "interval": job.interval,
+            "start_at": job.start_at,
+            "end_at": job.end_at,
+            **result,
         }
 
     async def _ensure_instrument(
@@ -533,6 +728,9 @@ class FXCMMarketSyncService:
                 {
                     "symbol": job.symbol,
                     "interval": job.interval,
+                    "kind": job.kind,
+                    "start_at": job.start_at,
+                    "end_at": job.end_at,
                     "requested_at": job.requested_at,
                 }
                 for job in self._priority_jobs

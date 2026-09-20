@@ -59,6 +59,23 @@ def catchup_outputsize(interval: str) -> int:
     return 2000
 
 
+def repair_outputsize(interval: str) -> int:
+    """框选修复时单次拉取条数。聚合周期要压在 sidecar 5000 根原始 K 线上限内。"""
+    if interval == "1week":
+        return 80
+    if interval == "1day":
+        return 400
+    if interval == "8h":
+        return 250
+    if interval == "4h":
+        return 400
+    if interval == "2h":
+        return 1000
+    if interval == "1h":
+        return 1500
+    return 2000
+
+
 def state_priority(interval: str, sync_intervals: list[str]) -> int:
     """根据周期在配置中的顺序计算任务优先级。"""
     try:

@@ -1,7 +1,8 @@
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,13 +12,16 @@ from app.services.fxcm_market_sync.constants import (
     ALWAYS_OPEN_ASSET_TYPES,
     BACKFILL_EARLIEST_DATE,
     PRIORITY_FORWARD_MAX_ROUNDS,
+    PRIORITY_REPAIR_MAX_ROUNDS,
     PROVIDER,
+    REPAIR_DB_CHUNK_SIZE,
 )
 from app.services.fxcm_market_sync.intervals import (
     calculate_next_sync_from,
     catchup_outputsize,
     incremental_outputsize,
     interval_delta,
+    repair_outputsize,
 )
 from app.services.fxcm_market_sync.scheduling_policy import normalize_asset_type
 from app.services.fxcm_market_sync.types import utc_now
@@ -177,6 +181,281 @@ class BarSyncHandler:
 
         self._finalize_state_success(state, instrument)
         return inserted_count
+
+    async def sync_range_repair(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> dict[str, Any]:
+        """按时间段重新采集 FXCM K 线，差异以新数据为准（含补缺与删除多余）。"""
+        start_at = self._as_utc(start_at)
+        end_at = self._as_utc(end_at)
+        state.last_attempt_at = utc_now()
+        state.last_status = "RUNNING"
+        state.last_error = None
+
+        fetched_rows = await self._fetch_range_bars(
+            state,
+            instrument,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        fetched_by_time = {
+            self._as_utc(row["bar_time"]): row for row in fetched_rows
+        }
+        if not fetched_by_time:
+            state.last_status = "FAILED"
+            state.last_error = "FXCM returned no bars for the selected range"
+            state.last_requested_start_at = start_at
+            state.last_requested_end_at = end_at
+            state.updated_at = utc_now()
+            return {
+                "ok": False,
+                "fetched_bars": 0,
+                "local_bars": 0,
+                "rows_inserted": 0,
+                "rows_updated": 0,
+                "rows_deleted": 0,
+                "rows_upserted": 0,
+                "unchanged_bars": 0,
+            }
+
+        local_bars = await self._load_local_bars(
+            db,
+            state,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        local_by_time = {self._as_utc(bar.bar_time): bar for bar in local_bars}
+
+        to_upsert: list[dict[str, Any]] = []
+        inserted_count = 0
+        updated_count = 0
+        unchanged_count = 0
+        for bar_time, row in fetched_by_time.items():
+            existing = local_by_time.get(bar_time)
+            if existing is None:
+                to_upsert.append(row)
+                inserted_count += 1
+                continue
+            if self._bars_equivalent(existing, row):
+                unchanged_count += 1
+                continue
+            to_upsert.append(row)
+            updated_count += 1
+
+        stale_times = [
+            bar_time
+            for bar_time in local_by_time
+            if bar_time not in fetched_by_time
+        ]
+
+        upserted = 0
+        for offset in range(0, len(to_upsert), REPAIR_DB_CHUNK_SIZE):
+            upserted += await self.upsert_bars(
+                db, to_upsert[offset : offset + REPAIR_DB_CHUNK_SIZE]
+            )
+
+        deleted_count = await self._delete_bars_at_times(
+            db,
+            state,
+            bar_times=stale_times,
+        )
+
+        await self._hydrate_state_from_storage(db, state)
+        state.last_success_at = utc_now()
+        state.last_status = "SUCCESS"
+        state.retry_count = 0
+        state.last_error = None
+        state.last_requested_start_at = start_at
+        state.last_requested_end_at = end_at
+        state.updated_at = utc_now()
+
+        return {
+            "ok": True,
+            "fetched_bars": len(fetched_by_time),
+            "local_bars": len(local_by_time),
+            "rows_inserted": inserted_count,
+            "rows_updated": updated_count,
+            "rows_deleted": deleted_count,
+            "rows_upserted": upserted,
+            "unchanged_bars": unchanged_count,
+        }
+
+    async def _fetch_range_bars(
+        self,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[dict[str, Any]]:
+        """按窗口分页拉取 [start_at, end_at] 的 FXCM K 线。"""
+        outputsize = repair_outputsize(state.interval)
+        delta = interval_delta(state.interval)
+        cursor = start_at
+        collected: dict[datetime, dict[str, Any]] = {}
+        previous_latest: datetime | None = None
+
+        for _ in range(PRIORITY_REPAIR_MAX_ROUNDS):
+            if cursor > end_at:
+                break
+
+            window_end = min(end_at, cursor + delta * outputsize)
+            if window_end <= cursor:
+                window_end = end_at
+
+            rows = await self._request_history_rows(
+                state,
+                instrument,
+                outputsize=outputsize,
+                start_date=cursor.isoformat(),
+                end_date=window_end.isoformat(),
+            )
+            in_range = [
+                row
+                for row in rows
+                if start_at <= self._as_utc(row["bar_time"]) <= end_at
+            ]
+            for row in in_range:
+                collected[self._as_utc(row["bar_time"])] = row
+
+            if not in_range:
+                if window_end >= end_at:
+                    break
+                cursor = window_end + delta
+                continue
+
+            latest = max(self._as_utc(row["bar_time"]) for row in in_range)
+            if previous_latest is not None and latest <= previous_latest:
+                if window_end >= end_at:
+                    break
+                cursor = window_end + delta
+                continue
+
+            previous_latest = latest
+            if latest >= end_at or window_end >= end_at:
+                break
+            if latest < window_end:
+                cursor = window_end + delta
+            else:
+                cursor = latest + delta
+
+        return list(collected.values())
+
+    async def _request_history_rows(
+        self,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+        *,
+        outputsize: int,
+        start_date: str | None,
+        end_date: str | None,
+    ) -> list[dict[str, Any]]:
+        """请求 sidecar 历史 K 线并转换为待落库行，不更新同步水位。"""
+        payload = await fxcm_sidecar_service.get_history(
+            symbol=instrument.provider_symbol,
+            interval=state.interval,
+            outputsize=outputsize,
+            start_date=start_date,
+            end_date=end_date,
+            price_type=state.price_type,
+        )
+        if (
+            isinstance(payload, Mapping)
+            and "values" not in payload
+            and isinstance(payload.get("data"), Mapping)
+        ):
+            payload = payload["data"]
+        values = payload.get("values") if isinstance(payload, Mapping) else []
+        return self.build_bar_rows(
+            instrument=instrument,
+            state=state,
+            values=values if isinstance(values, list) else [],
+            meta=payload.get("meta") if isinstance(payload, Mapping) else None,
+        )
+
+    async def _load_local_bars(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> list[MarketOHLCVBar]:
+        """读取本地指定时间段内的已有 K 线。"""
+        stmt = (
+            select(MarketOHLCVBar)
+            .where(
+                MarketOHLCVBar.instrument_id == state.instrument_id,
+                MarketOHLCVBar.interval == state.interval,
+                MarketOHLCVBar.price_type == state.price_type,
+                MarketOHLCVBar.provider == PROVIDER,
+                MarketOHLCVBar.bar_time >= start_at,
+                MarketOHLCVBar.bar_time <= end_at,
+            )
+            .order_by(MarketOHLCVBar.bar_time.asc())
+        )
+        return list((await db.execute(stmt)).scalars().all())
+
+    async def _delete_bars_at_times(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        *,
+        bar_times: Sequence[datetime],
+    ) -> int:
+        """删除指定时间戳上的本地 K 线。"""
+        if not bar_times:
+            return 0
+
+        deleted = 0
+        unique_times = list(dict.fromkeys(bar_times))
+        for offset in range(0, len(unique_times), REPAIR_DB_CHUNK_SIZE):
+            chunk = unique_times[offset : offset + REPAIR_DB_CHUNK_SIZE]
+            result = await db.execute(
+                delete(MarketOHLCVBar).where(
+                    MarketOHLCVBar.instrument_id == state.instrument_id,
+                    MarketOHLCVBar.interval == state.interval,
+                    MarketOHLCVBar.price_type == state.price_type,
+                    MarketOHLCVBar.provider == PROVIDER,
+                    MarketOHLCVBar.bar_time.in_(chunk),
+                )
+            )
+            deleted += int(result.rowcount or 0)
+        return deleted
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _bars_equivalent(existing: MarketOHLCVBar, row: Mapping[str, Any]) -> bool:
+        """判断本地 K 线与新采集数据是否一致。"""
+        return (
+            BarSyncHandler._decimals_equal(existing.open, row.get("open"))
+            and BarSyncHandler._decimals_equal(existing.high, row.get("high"))
+            and BarSyncHandler._decimals_equal(existing.low, row.get("low"))
+            and BarSyncHandler._decimals_equal(existing.close, row.get("close"))
+            and (existing.volume or 0) == (row.get("volume") or 0)
+        )
+
+    @staticmethod
+    def _decimals_equal(left: Any, right: Any) -> bool:
+        if left is None and right is None:
+            return True
+        if left is None or right is None:
+            return False
+        try:
+            return Decimal(str(left)) == Decimal(str(right))
+        except Exception:
+            return False
 
     async def _pull_forward_bars(
         self,
