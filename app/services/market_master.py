@@ -276,6 +276,10 @@ class MarketMasterService:
         timezone: str = DEFAULT_KLINE_TIMEZONE,
         start_date: str | None = None,
         end_date: str | None = None,
+        offset: int | None = None,
+        around_time: str | int | float | None = None,
+        before_count: int | None = None,
+        after_date: str | None = None,
         adjust: str | None = None,
         prepost: bool | None = None,
         dp: int | None = None,
@@ -293,6 +297,10 @@ class MarketMasterService:
                 "timezone": timezone,
                 "start_date": start_date,
                 "end_date": end_date,
+                "offset": offset,
+                "around_time": around_time,
+                "before_count": before_count,
+                "after_date": after_date,
                 "adjust": adjust,
                 "prepost": prepost,
                 "dp": dp,
@@ -863,6 +871,19 @@ class MarketMasterService:
         history_params = self._build_fxcm_history_params(query_params)
         start_dt = self._parse_request_datetime(history_params.get("start_date"))
         end_dt = self._parse_request_datetime(history_params.get("end_date"))
+        requested_offset = self._to_int(query_params.get("offset"))
+        around_dt = self._parse_around_time(
+            query_params.get("around_time") or query_params.get("aroundTime")
+        )
+        after_dt = self._parse_around_time(
+            query_params.get("after_date") or query_params.get("afterDate")
+        )
+        before_count = self._bounded_int(
+            query_params.get("before_count") or query_params.get("before"),
+            default=0,
+            minimum=0,
+            maximum=outputsize,
+        )
 
         async with db_client.async_session() as db:
             instrument_stmt = select(MarketInstrument).where(
@@ -882,21 +903,150 @@ class MarketMasterService:
             if start_dt is not None and start_dt > BACKFILL_EARLIEST_DATE:
                 effective_start = start_dt
 
-            bar_stmt = select(MarketOHLCVBar).where(
+            base_filters = (
                 MarketOHLCVBar.instrument_id == instrument.id,
                 MarketOHLCVBar.interval == requested_interval,
                 MarketOHLCVBar.price_type == "mid",
                 MarketOHLCVBar.bar_time >= effective_start,
             )
-            if end_dt is not None:
-                bar_stmt = bar_stmt.where(MarketOHLCVBar.bar_time < end_dt)
-
-            bar_stmt = bar_stmt.order_by(MarketOHLCVBar.bar_time.desc()).limit(
-                outputsize + 1
-            )
-            bars = list((await db.execute(bar_stmt)).scalars().all())
-            if not bars:
+            stats_row = (
+                await db.execute(
+                    select(
+                        func.count(),
+                        func.min(MarketOHLCVBar.bar_time),
+                        func.max(MarketOHLCVBar.bar_time),
+                    ).where(*base_filters)
+                )
+            ).one()
+            total = int(stats_row[0] or 0)
+            earliest_dt = stats_row[1]
+            latest_dt = stats_row[2]
+            if total <= 0:
                 return None
+
+            window_offset: int | None = None
+            extra_older_bar = None
+
+            if around_dt is not None:
+                older_stmt = (
+                    select(MarketOHLCVBar)
+                    .where(*base_filters, MarketOHLCVBar.bar_time < around_dt)
+                    .order_by(MarketOHLCVBar.bar_time.desc())
+                    .limit(before_count + 1)
+                )
+                older_desc = list((await db.execute(older_stmt)).scalars().all())
+                older_chrono = list(reversed(older_desc))
+                if before_count > 0 and len(older_chrono) > before_count:
+                    extra_older_bar = older_chrono[0]
+                    window_older = older_chrono[1:]
+                else:
+                    window_older = older_chrono
+
+                newer_needed = max(outputsize - len(window_older), 1)
+                newer_stmt = (
+                    select(MarketOHLCVBar)
+                    .where(*base_filters, MarketOHLCVBar.bar_time >= around_dt)
+                    .order_by(MarketOHLCVBar.bar_time.asc())
+                    .limit(newer_needed)
+                )
+                newer_bars = list((await db.execute(newer_stmt)).scalars().all())
+                window_bars = window_older + newer_bars
+                chronological = (
+                    [extra_older_bar] if extra_older_bar is not None else []
+                ) + window_bars
+                bars_before = int(
+                    (
+                        await db.execute(
+                            select(func.count())
+                            .select_from(MarketOHLCVBar)
+                            .where(
+                                *base_filters,
+                                MarketOHLCVBar.bar_time < around_dt,
+                            )
+                        )
+                    ).scalar()
+                    or 0
+                )
+                window_offset = max(0, bars_before - len(window_older))
+            elif requested_offset is not None:
+                window_offset = max(0, requested_offset)
+                if window_offset >= total:
+                    window_offset = max(0, total - min(outputsize, total))
+                fetch_start = max(0, window_offset - 1)
+                extra = 1 if fetch_start < window_offset else 0
+                from_end = max(0, total - window_offset - outputsize)
+                if from_end < fetch_start:
+                    bar_stmt = (
+                        select(MarketOHLCVBar)
+                        .where(*base_filters)
+                        .order_by(MarketOHLCVBar.bar_time.desc())
+                        .offset(from_end)
+                        .limit(outputsize + extra)
+                    )
+                    bars = list((await db.execute(bar_stmt)).scalars().all())
+                    chronological = list(reversed(bars))
+                else:
+                    bar_stmt = (
+                        select(MarketOHLCVBar)
+                        .where(*base_filters)
+                        .order_by(MarketOHLCVBar.bar_time.asc())
+                        .offset(fetch_start)
+                        .limit(outputsize + extra)
+                    )
+                    chronological = list(
+                        (await db.execute(bar_stmt)).scalars().all()
+                    )
+            elif after_dt is not None:
+                prev_stmt = (
+                    select(MarketOHLCVBar)
+                    .where(*base_filters, MarketOHLCVBar.bar_time <= after_dt)
+                    .order_by(MarketOHLCVBar.bar_time.desc())
+                    .limit(1)
+                )
+                prev_bar = (await db.execute(prev_stmt)).scalars().first()
+                newer_stmt = (
+                    select(MarketOHLCVBar)
+                    .where(*base_filters, MarketOHLCVBar.bar_time > after_dt)
+                    .order_by(MarketOHLCVBar.bar_time.asc())
+                    .limit(outputsize)
+                )
+                newer_bars = list((await db.execute(newer_stmt)).scalars().all())
+                chronological = (
+                    [prev_bar] if prev_bar is not None else []
+                ) + newer_bars
+            else:
+                bar_stmt = select(MarketOHLCVBar).where(*base_filters)
+                if end_dt is not None:
+                    bar_stmt = bar_stmt.where(MarketOHLCVBar.bar_time < end_dt)
+                bar_stmt = bar_stmt.order_by(MarketOHLCVBar.bar_time.desc()).limit(
+                    outputsize + 1
+                )
+                bars = list((await db.execute(bar_stmt)).scalars().all())
+                chronological = list(reversed(bars))
+
+            if not chronological:
+                return None
+
+            window_bars = (
+                chronological[-outputsize:]
+                if len(chronological) > outputsize
+                else chronological
+            )
+            if window_offset is None:
+                oldest_time = window_bars[0].bar_time
+                window_offset = int(
+                    (
+                        await db.execute(
+                            select(func.count())
+                            .select_from(MarketOHLCVBar)
+                            .where(
+                                *base_filters,
+                                MarketOHLCVBar.bar_time < oldest_time,
+                            )
+                        )
+                    ).scalar()
+                    or 0
+                )
 
         values = [
             {
@@ -908,7 +1058,7 @@ class MarketMasterService:
                 "close": float(bar.close),
                 "volume": bar.volume,
             }
-            for bar in reversed(bars)
+            for bar in chronological
         ]
 
         payload = {
@@ -918,7 +1068,15 @@ class MarketMasterService:
                 "requested_interval": requested_interval,
                 "provider_interval": requested_interval,
                 "price_type": "mid",
-                "count": len(values),
+                "count": len(window_bars),
+                "total": total,
+                "offset": window_offset,
+                "earliest": earliest_dt.astimezone(timezone.utc).isoformat()
+                if earliest_dt is not None
+                else None,
+                "latest": latest_dt.astimezone(timezone.utc).isoformat()
+                if latest_dt is not None
+                else None,
                 "currency": instrument.currency,
                 "exchange": instrument.exchange,
                 "exchange_timezone": instrument.exchange_timezone,
@@ -1051,6 +1209,13 @@ class MarketMasterService:
             for row in rows
         ]
 
+        total = self._to_int(meta.get("total"))
+        offset = self._to_int(meta.get("offset"))
+        if total is None:
+            total = len(values)
+        if offset is None:
+            offset = 0
+
         return {
             "meta": {
                 "symbol": self._to_str(meta.get("symbol"))
@@ -1064,6 +1229,13 @@ class MarketMasterService:
                 "exchange_timezone": self._to_str(meta.get("exchange_timezone"))
                 or "UTC",
                 "type": self._to_str(meta.get("asset_type")),
+                "count": len(values),
+                "total": total,
+                "offset": offset,
+                "has_more_history": offset > 0,
+                "has_more_future": offset + len(values) < total,
+                "earliest": self._to_str(meta.get("earliest")),
+                "latest": self._to_str(meta.get("latest")),
             },
             "values": values,
         }
@@ -1589,13 +1761,38 @@ class MarketMasterService:
     def _parse_request_datetime(self, value: str | None) -> datetime | None:
         if value is None:
             return None
+        normalized = value.strip()
+        if normalized.endswith(("Z", "z")):
+            normalized = f"{normalized[:-1]}+00:00"
         try:
-            parsed = datetime.fromisoformat(value)
+            parsed = datetime.fromisoformat(normalized)
         except ValueError:
             return None
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    def _parse_around_time(self, value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        parsed = self._parse_request_datetime(self._to_str(value))
+        if parsed is not None:
+            return parsed
+
+        timestamp = self._to_float(value)
+        if timestamp is None:
+            return None
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
 
     def _bounded_int(
         self,
@@ -1775,6 +1972,12 @@ class MarketMasterService:
                 "symbol": requested_symbol,
                 "interval": requested_interval,
                 "count": 0,
+                "total": 0,
+                "offset": 0,
+                "has_more_history": False,
+                "has_more_future": False,
+                "earliest": None,
+                "latest": None,
                 "defaults_applied": dict(defaults_applied),
                 "filtering": dict(filter_info or {}),
                 "meta": {},
@@ -1792,11 +1995,23 @@ class MarketMasterService:
         candles = [
             self._normalize_candle(item) for item in values if isinstance(item, Mapping)
         ]
+        total = self._to_int(meta.get("total"))
+        offset = self._to_int(meta.get("offset"))
+        if total is None:
+            total = len(candles)
+        if offset is None:
+            offset = 0
 
         return {
             "symbol": meta.get("symbol") or requested_symbol,
             "interval": meta.get("interval") or requested_interval,
             "count": len(candles),
+            "total": total,
+            "offset": offset,
+            "has_more_history": offset > 0,
+            "has_more_future": offset + len(candles) < total,
+            "earliest": meta.get("earliest"),
+            "latest": meta.get("latest"),
             "defaults_applied": dict(defaults_applied),
             "filtering": dict(filter_info or {}),
             "meta": {
@@ -1807,6 +2022,10 @@ class MarketMasterService:
                 "mic_code": meta.get("mic_code"),
                 "exchange_timezone": meta.get("exchange_timezone"),
                 "asset_type": meta.get("type"),
+                "total": total,
+                "offset": offset,
+                "earliest": meta.get("earliest"),
+                "latest": meta.get("latest"),
             },
             "candles": candles,
         }

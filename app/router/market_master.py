@@ -189,6 +189,8 @@ async def get_quote(
     description=(
         "通过 FXCM sidecar 返回兼容的历史 OHLCV 时序数据。"
         "服务端会补齐 outputsize、周期映射、时区处理与部分聚合逻辑。"
+        "每次返回当前窗口以及该品种/周期的 K 线总数 total、窗口起点 offset。"
+        "可通过 offset / around_time 按需截取窗口，而不必一次拉全量历史。"
     ),
 )
 async def get_time_series(
@@ -242,6 +244,25 @@ async def get_time_series(
     end_date: str | None = Query(
         None,
         description="结束时间，可传 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM:SS。",
+    ),
+    offset: int | None = Query(
+        None,
+        ge=0,
+        description="从最早一根 K 线起的 0-based 偏移。传入后按时间升序返回该窗口，适合回测跳转与向未来续载。",
+    ),
+    around_time: str | None = Query(
+        None,
+        description="定位到该时间附近的 K 线窗口。可传 ISO 时间或 unix 秒。常用于还原回测起点。",
+    ),
+    before_count: int | None = Query(
+        None,
+        ge=0,
+        le=5000,
+        description="配合 around_time：在定位 K 线之前额外保留多少根上下文，默认 0。",
+    ),
+    after_date: str | None = Query(
+        None,
+        description="返回该时间之后的 K 线（不含该时刻本身），用于向未来续载。",
     ),
     date: str | None = Query(
         None,
@@ -497,6 +518,7 @@ async def get_watchlist_quotes(
     description=(
         "对 FXCM sidecar 历史 K 线接口做前端友好的默认参数封装。默认 outputsize=120、timezone=Exchange、"
         "order=desc、previous_close=true，默认不过滤休市时段，并补齐 filtering 信息与 candles 数组结构。"
+        "响应包含 total（该品种/周期全部 K 线数量）与 offset（当前窗口在全量中的起点）。"
     ),
 )
 async def get_kline_defaults(
@@ -533,6 +555,25 @@ async def get_kline_defaults(
         None,
         description="结束时间，可传 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM:SS。",
     ),
+    offset: int | None = Query(
+        None,
+        ge=0,
+        description="从最早一根 K 线起的 0-based 偏移。传入后按时间升序返回该窗口。",
+    ),
+    around_time: str | None = Query(
+        None,
+        description="定位到该时间附近的 K 线窗口。可传 ISO 时间或 unix 秒。",
+    ),
+    before_count: int | None = Query(
+        None,
+        ge=0,
+        le=5000,
+        description="配合 around_time：在定位 K 线之前额外保留多少根上下文，默认 0。",
+    ),
+    after_date: str | None = Query(
+        None,
+        description="返回该时间之后的 K 线（不含该时刻本身），用于向未来续载。",
+    ),
     adjust: str | None = Query(
         None,
         description="兼容保留参数。当前 FXCM 历史接口未使用该参数。",
@@ -564,6 +605,10 @@ async def get_kline_defaults(
             timezone=timezone,
             start_date=start_date,
             end_date=end_date,
+            offset=offset,
+            around_time=around_time,
+            before_count=before_count,
+            after_date=after_date,
             adjust=adjust,
             prepost=prepost,
             dp=dp,
