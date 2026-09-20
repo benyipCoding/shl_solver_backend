@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -189,6 +189,43 @@ class MarketBacktestService:
         await db.commit()
         await db.refresh(session)
         return self._serialize_session(session)
+
+    async def delete_session(
+        self,
+        db: AsyncSession,
+        user: User,
+        public_id: str,
+    ) -> dict:
+        session = await self._get_session_by_public_id(db, public_id)
+        if session is None:
+            raise BacktestPersistError(404, "回测场次不存在")
+        if not getattr(user, "is_superuser", False) and session.user_id != user.id:
+            raise BacktestPersistError(403, "只能删除自己的回测记录")
+
+        now = datetime.now(timezone.utc)
+        session.deleted_at = now
+        if session.status == "RUNNING":
+            session.status = "ABANDONED"
+            session.ended_at = now
+
+        await db.execute(
+            update(MarketBacktestTrade)
+            .where(
+                MarketBacktestTrade.session_id == session.id,
+                MarketBacktestTrade.deleted_at.is_(None),
+            )
+            .values(deleted_at=now)
+        )
+        await db.execute(
+            update(MarketBacktestEvent)
+            .where(
+                MarketBacktestEvent.session_id == session.id,
+                MarketBacktestEvent.deleted_at.is_(None),
+            )
+            .values(deleted_at=now)
+        )
+        await db.commit()
+        return {"public_id": session.public_id, "deleted": True}
 
     async def list_sessions(
         self,
@@ -516,18 +553,22 @@ class MarketBacktestService:
             raise BacktestPersistError(400, f"未找到交易品种 {symbol}")
         return instrument
 
-    async def _get_owned_session(
-        self, db: AsyncSession, user_id: int, public_id: str
-    ) -> MarketBacktestSession:
+    async def _get_session_by_public_id(
+        self, db: AsyncSession, public_id: str
+    ) -> MarketBacktestSession | None:
         result = await db.execute(
             select(MarketBacktestSession).where(
                 MarketBacktestSession.public_id == public_id,
-                MarketBacktestSession.user_id == user_id,
                 MarketBacktestSession.deleted_at.is_(None),
             )
         )
-        session = result.scalars().first()
-        if session is None:
+        return result.scalars().first()
+
+    async def _get_owned_session(
+        self, db: AsyncSession, user_id: int, public_id: str
+    ) -> MarketBacktestSession:
+        session = await self._get_session_by_public_id(db, public_id)
+        if session is None or session.user_id != user_id:
             raise BacktestPersistError(404, "回测场次不存在")
         return session
 

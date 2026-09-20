@@ -840,3 +840,21 @@ async def complete_backtest_session(
     except BacktestPersistError as exc:
         return _backtest_error_response(exc)
     return APIResponse(data=result)
+
+
+@router.delete(
+    "/backtest/sessions/{public_id}",
+    response_model=APIResponse[Any],
+    summary="删除回测场次",
+    description="软删除一场回测记录。普通用户只能删除自己的场次，超级管理员可删除任意场次。",
+)
+async def delete_backtest_session(
+    public_id: str = Path(..., min_length=1, description="回测场次 public_id"),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.delete_session(db, user, public_id)
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
