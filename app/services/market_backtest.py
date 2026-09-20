@@ -154,6 +154,16 @@ class MarketBacktestService:
             self._bump_cursor(session, cursor_bar_time, payload.cursor_bar_index)
 
         if session.status == "RUNNING":
+            # 从未下单的回测没有回放价值，软删除以免占历史名额
+            if (session.trade_count or 0) <= 0:
+                now = datetime.now(timezone.utc)
+                session.deleted_at = now
+                session.status = "ABANDONED"
+                session.ended_at = now
+                await db.commit()
+                await db.refresh(session)
+                return self._serialize_session(session)
+
             mark_price = to_decimal(payload.mark_price)
             if (
                 mark_price is not None

@@ -825,7 +825,7 @@ async def record_backtest_event(
     "/backtest/sessions/{public_id}/complete",
     response_model=APIResponse[Any],
     summary="结束逐K回测场次",
-    description="退出回测时调用。仍未平仓的持仓会按 mark_price 强制平仓。",
+    description="退出回测时调用。仍未平仓的持仓会按 mark_price 强制平仓；若本场无任何开仓则软删除，不进入历史列表。",
 )
 async def complete_backtest_session(
     payload: BacktestSessionComplete,
