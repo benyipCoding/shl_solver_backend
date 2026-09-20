@@ -657,6 +657,45 @@ async def create_backtest_session(
     return APIResponse(data=result)
 
 
+@router.get(
+    "/backtest/sessions",
+    response_model=APIResponse[Any],
+    summary="回测场次列表",
+    description="按创建时间倒序列出当前用户的逐K回测记录，用于历史弹窗还原播放。",
+)
+async def list_backtest_sessions(
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    size: int = Query(20, ge=1, le=100, description="每页条数"),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.list_sessions(db, user, page, size)
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.get(
+    "/backtest/sessions/{public_id}",
+    response_model=APIResponse[Any],
+    summary="回测场次详情",
+    description="返回场次、成交和事件流，供前端按 sequence_no 一比一还原播放。",
+)
+async def get_backtest_session(
+    public_id: str = Path(..., min_length=1, description="回测场次 public_id"),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.get_session_detail(
+            db, user, public_id
+        )
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
 @router.post(
     "/backtest/sessions/{public_id}/events",
     response_model=APIResponse[Any],

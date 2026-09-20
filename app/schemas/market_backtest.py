@@ -64,6 +64,15 @@ class BacktestSessionView(BaseModel):
     closed_trade_count: int
     win_count: int
     realized_pnl: Decimal
+    created_at: datetime | None = None
+    ended_at: datetime | None = None
+
+
+class BacktestSessionListResponse(BaseModel):
+    items: list[BacktestSessionView]
+    total: int
+    page: int
+    size: int
 
 
 class BacktestEventResult(BaseModel):

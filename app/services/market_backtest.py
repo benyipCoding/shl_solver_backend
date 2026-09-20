@@ -180,6 +180,77 @@ class MarketBacktestService:
         await db.refresh(session)
         return self._serialize_session(session)
 
+    async def list_sessions(
+        self,
+        db: AsyncSession,
+        user: User,
+        page: int,
+        size: int,
+    ) -> dict:
+        filters = (
+            MarketBacktestSession.user_id == user.id,
+            MarketBacktestSession.deleted_at.is_(None),
+        )
+        count_result = await db.execute(
+            select(func.count())
+            .select_from(MarketBacktestSession)
+            .where(*filters)
+        )
+        total = int(count_result.scalar() or 0)
+        result = await db.execute(
+            select(MarketBacktestSession)
+            .where(*filters)
+            .order_by(MarketBacktestSession.created_at.desc())
+            .offset((page - 1) * size)
+            .limit(size)
+        )
+        return {
+            "items": [
+                self._serialize_session(session)
+                for session in result.scalars().all()
+            ],
+            "total": total,
+            "page": page,
+            "size": size,
+        }
+
+    async def get_session_detail(
+        self,
+        db: AsyncSession,
+        user: User,
+        public_id: str,
+    ) -> dict:
+        session = await self._get_owned_session(db, user.id, public_id)
+        trades_result = await db.execute(
+            select(MarketBacktestTrade)
+            .where(
+                MarketBacktestTrade.session_id == session.id,
+                MarketBacktestTrade.deleted_at.is_(None),
+            )
+            .order_by(MarketBacktestTrade.sequence_no.asc())
+        )
+        events_result = await db.execute(
+            select(MarketBacktestEvent, MarketBacktestTrade.client_trade_id)
+            .join(
+                MarketBacktestTrade,
+                MarketBacktestEvent.trade_id == MarketBacktestTrade.id,
+            )
+            .where(
+                MarketBacktestEvent.session_id == session.id,
+                MarketBacktestEvent.deleted_at.is_(None),
+            )
+            .order_by(MarketBacktestEvent.sequence_no.asc())
+        )
+        payload = self._serialize_session(session)
+        payload["trades"] = [
+            self._serialize_trade(trade) for trade in trades_result.scalars().all()
+        ]
+        payload["events"] = [
+            self._serialize_event(event, client_trade_id)
+            for event, client_trade_id in events_result.all()
+        ]
+        return payload
+
     async def _open_trade(
         self,
         db: AsyncSession,
@@ -547,7 +618,15 @@ class MarketBacktestService:
         return _CLOSE_REASON_ALIASES.get(value.strip().upper(), "MARKET_CLOSE")
 
     @staticmethod
-    def _serialize_session(session: MarketBacktestSession) -> dict:
+    def _iso(value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    @staticmethod
+    def _num(value) -> float | None:
+        return float(value) if value is not None else None
+
+    @classmethod
+    def _serialize_session(cls, session: MarketBacktestSession) -> dict:
         return {
             "public_id": session.public_id,
             "client_session_id": session.client_session_id,
@@ -556,23 +635,59 @@ class MarketBacktestService:
             "timeframe": session.timeframe,
             "status": session.status,
             "visibility": session.visibility,
-            "start_bar_time": session.start_bar_time.isoformat()
-            if session.start_bar_time
-            else None,
+            "start_bar_time": cls._iso(session.start_bar_time),
             "start_bar_index": session.start_bar_index,
             "initial_visible_bars": session.initial_visible_bars,
-            "cursor_bar_time": session.cursor_bar_time.isoformat()
-            if session.cursor_bar_time
-            else None,
+            "cursor_bar_time": cls._iso(session.cursor_bar_time),
             "cursor_bar_index": session.cursor_bar_index,
             "initial_balance": float(session.initial_balance or 0),
-            "ending_balance": float(session.ending_balance)
-            if session.ending_balance is not None
-            else None,
+            "ending_balance": cls._num(session.ending_balance),
             "trade_count": session.trade_count,
             "closed_trade_count": session.closed_trade_count,
             "win_count": session.win_count,
             "realized_pnl": float(session.realized_pnl or 0),
+            "created_at": cls._iso(session.created_at),
+            "ended_at": cls._iso(session.ended_at),
+        }
+
+    @classmethod
+    def _serialize_trade(cls, trade: MarketBacktestTrade) -> dict:
+        return {
+            "client_trade_id": trade.client_trade_id,
+            "sequence_no": trade.sequence_no,
+            "side": trade.side,
+            "units": trade.units,
+            "status": trade.status,
+            "entry_price": cls._num(trade.entry_price),
+            "entry_bar_time": cls._iso(trade.entry_bar_time),
+            "entry_bar_index": trade.entry_bar_index,
+            "sl_price": cls._num(trade.sl_price),
+            "tp_price": cls._num(trade.tp_price),
+            "close_price": cls._num(trade.close_price),
+            "close_bar_time": cls._iso(trade.close_bar_time),
+            "close_bar_index": trade.close_bar_index,
+            "close_reason": trade.close_reason,
+            "realized_pnl": cls._num(trade.realized_pnl),
+        }
+
+    @classmethod
+    def _serialize_event(
+        cls,
+        event: MarketBacktestEvent,
+        client_trade_id: str | None,
+    ) -> dict:
+        return {
+            "sequence_no": event.sequence_no,
+            "event_type": event.event_type,
+            "bar_time": cls._iso(event.bar_time),
+            "bar_index": event.bar_index,
+            "client_trade_id": client_trade_id,
+            "side": event.side,
+            "units": event.units,
+            "price": cls._num(event.price),
+            "sl_price": cls._num(event.sl_price),
+            "tp_price": cls._num(event.tp_price),
+            "close_reason": event.close_reason,
         }
 
     @staticmethod
