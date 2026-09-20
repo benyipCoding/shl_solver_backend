@@ -2,12 +2,24 @@ from typing import Any, Awaitable
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients import db as db_client
-from app.depends.jwt_guard import verify_superuser
+from app.clients.db import get_db
+from app.depends.jwt_guard import verify_superuser, verify_user
+from app.models.user import User
+from app.schemas.market_backtest import (
+    BacktestEventCreate,
+    BacktestSessionComplete,
+    BacktestSessionCreate,
+)
 from app.schemas.response import APIResponse
 from app.services.fxcm_market_sync import fxcm_market_sync_service
 from app.services.fxcm_market_sync.types import PriorityForwardSyncError
+from app.services.market_backtest import (
+    BacktestPersistError,
+    market_backtest_service,
+)
 from app.services.market_master import TwelveDataAPIError, market_master_service
 
 
@@ -614,3 +626,73 @@ async def get_unified_search(
             show_plan=show_plan,
         )
     )
+
+
+def _backtest_error_response(exc: BacktestPersistError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.status_code,
+            "message": exc.message,
+            "data": None,
+        },
+    )
+
+
+@router.post(
+    "/backtest/sessions",
+    response_model=APIResponse[Any],
+    summary="创建逐K回测场次",
+    description="用户开启逐K回测时创建一场 session。相同 client_session_id 重复提交会返回已有场次。",
+)
+async def create_backtest_session(
+    payload: BacktestSessionCreate,
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.create_session(db, user, payload)
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/backtest/sessions/{public_id}/events",
+    response_model=APIResponse[Any],
+    summary="写入回测开仓/改价/平仓事件",
+)
+async def record_backtest_event(
+    payload: BacktestEventCreate,
+    public_id: str = Path(..., min_length=1, description="回测场次 public_id"),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.record_event(
+            db, user, public_id, payload
+        )
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/backtest/sessions/{public_id}/complete",
+    response_model=APIResponse[Any],
+    summary="结束逐K回测场次",
+    description="退出回测时调用。仍未平仓的持仓会按 mark_price 强制平仓。",
+)
+async def complete_backtest_session(
+    payload: BacktestSessionComplete,
+    public_id: str = Path(..., min_length=1, description="回测场次 public_id"),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.complete_session(
+            db, user, public_id, payload
+        )
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
