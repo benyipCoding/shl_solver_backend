@@ -120,7 +120,7 @@ class MarketBacktestService:
         public_id: str,
         payload: BacktestEventCreate,
     ) -> dict:
-        session = await self._get_owned_session(db, user.id, public_id)
+        session = await self._get_owned_session(db, user.id, public_id, for_update=True)
         if session.status != "RUNNING":
             raise BacktestPersistError(409, "回测场次已结束，无法再写入成交")
 
@@ -144,7 +144,7 @@ class MarketBacktestService:
         public_id: str,
         payload: BacktestSessionComplete,
     ) -> dict:
-        session = await self._get_owned_session(db, user.id, public_id)
+        session = await self._get_owned_session(db, user.id, public_id, for_update=True)
         cursor_bar_time = (
             self._parse_bar_time(payload.cursor_bar_time)
             if payload.cursor_bar_time is not None
@@ -367,7 +367,7 @@ class MarketBacktestService:
     ) -> dict:
         trade = await self._require_open_trade(db, session.id, payload.client_trade_id)
         new_price = to_decimal(payload.price)
-        if new_price is None:
+        if "price" not in payload.model_fields_set:
             raise BacktestPersistError(400, "改价事件缺少价格")
 
         if payload.event_type == "MODIFY_SL":
@@ -419,6 +419,8 @@ class MarketBacktestService:
             bar_time=bar_time,
             bar_index=payload.bar_index,
             close_reason=self._normalize_close_reason(payload.close_reason),
+            close_units=payload.units,
+            client_event_id=payload.client_event_id,
         )
         return self._serialize_event_result(session, trade, "CLOSE", event.sequence_no)
 
@@ -459,22 +461,50 @@ class MarketBacktestService:
         bar_time: datetime,
         bar_index: int | None,
         close_reason: str,
+        close_units: int | None = None,
+        client_event_id: str | None = None,
     ) -> MarketBacktestEvent:
+        # The position keeps its original size; CLOSE events track each fill.
+        # This also supports legacy events that closed the entire position.
+        result = await db.execute(
+            select(MarketBacktestEvent).where(
+                MarketBacktestEvent.trade_id == trade.id,
+                MarketBacktestEvent.event_type == "CLOSE",
+                MarketBacktestEvent.deleted_at.is_(None),
+            )
+        )
+        previous_closes = result.scalars().all()
+        if client_event_id:
+            for previous in previous_closes:
+                if (previous.payload or {}).get("client_event_id") == client_event_id:
+                    return previous
+        remaining_units = trade.units - sum(event.units or 0 for event in previous_closes)
+        units = remaining_units if close_units is None else close_units
+        if units <= 0 or units > remaining_units:
+            raise BacktestPersistError(400, "平仓数量超出剩余持仓")
+
         realized_points = (
             close_price - trade.entry_price
             if trade.side == "BUY"
             else trade.entry_price - close_price
         )
-        realized_pnl = realized_points * Decimal(trade.units)
-        now = datetime.now(timezone.utc)
-        trade.status = "CLOSED"
-        trade.close_price = close_price
-        trade.close_bar_time = bar_time
-        trade.close_bar_index = bar_index
-        trade.close_reason = close_reason
-        trade.realized_points = realized_points
-        trade.realized_pnl = realized_pnl
-        trade.closed_at = now
+        realized_pnl = realized_points * Decimal(units)
+        trade.realized_pnl = (trade.realized_pnl or Decimal("0")) + realized_pnl
+        if units == remaining_units:
+            trade.status = "CLOSED"
+            trade.realized_points = trade.realized_pnl / Decimal(trade.units)
+            # The final snapshot uses the weighted average fill price; events
+            # retain exact fill prices/times for replay and chart markers.
+            trade.close_price = trade.entry_price + (
+                trade.realized_points if trade.side == "BUY" else -trade.realized_points
+            )
+            trade.close_bar_time = bar_time
+            trade.close_bar_index = bar_index
+            trade.close_reason = close_reason
+            trade.closed_at = datetime.now(timezone.utc)
+            session.closed_trade_count = (session.closed_trade_count or 0) + 1
+            if trade.realized_pnl > 0:
+                session.win_count = (session.win_count or 0) + 1
 
         event = await self._append_event(
             db,
@@ -484,15 +514,13 @@ class MarketBacktestService:
             bar_time=bar_time,
             bar_index=bar_index,
             side=trade.side,
-            units=trade.units,
+            units=units,
             price=close_price,
             sl_price=trade.sl_price,
             tp_price=trade.tp_price,
             close_reason=close_reason,
+            event_payload={"client_event_id": client_event_id} if client_event_id else None,
         )
-        session.closed_trade_count = (session.closed_trade_count or 0) + 1
-        if realized_pnl > 0:
-            session.win_count = (session.win_count or 0) + 1
         session.realized_pnl = (session.realized_pnl or Decimal("0")) + realized_pnl
         return event
 
@@ -511,6 +539,7 @@ class MarketBacktestService:
         sl_price: Decimal | None,
         tp_price: Decimal | None,
         close_reason: str | None = None,
+        event_payload: dict | None = None,
     ) -> MarketBacktestEvent:
         sequence_no = await self._next_event_sequence(db, session.id)
         event = MarketBacktestEvent(
@@ -526,6 +555,7 @@ class MarketBacktestService:
             sl_price=sl_price,
             tp_price=tp_price,
             close_reason=close_reason,
+            payload=event_payload,
         )
         db.add(event)
         await db.flush()
@@ -554,20 +584,21 @@ class MarketBacktestService:
         return instrument
 
     async def _get_session_by_public_id(
-        self, db: AsyncSession, public_id: str
+        self, db: AsyncSession, public_id: str, *, for_update: bool = False
     ) -> MarketBacktestSession | None:
-        result = await db.execute(
-            select(MarketBacktestSession).where(
-                MarketBacktestSession.public_id == public_id,
-                MarketBacktestSession.deleted_at.is_(None),
-            )
+        statement = select(MarketBacktestSession).where(
+            MarketBacktestSession.public_id == public_id,
+            MarketBacktestSession.deleted_at.is_(None),
         )
+        if for_update:
+            statement = statement.with_for_update()
+        result = await db.execute(statement)
         return result.scalars().first()
 
     async def _get_owned_session(
-        self, db: AsyncSession, user_id: int, public_id: str
+        self, db: AsyncSession, user_id: int, public_id: str, *, for_update: bool = False
     ) -> MarketBacktestSession:
-        session = await self._get_session_by_public_id(db, public_id)
+        session = await self._get_session_by_public_id(db, public_id, for_update=for_update)
         if session is None or session.user_id != user_id:
             raise BacktestPersistError(404, "回测场次不存在")
         return session

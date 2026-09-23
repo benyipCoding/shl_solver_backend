@@ -26,11 +26,12 @@ class BacktestEventCreate(BaseModel):
 
     event_type: Literal["OPEN", "MODIFY_SL", "MODIFY_TP", "CLOSE"]
     client_trade_id: str = Field(..., min_length=1, max_length=64)
+    client_event_id: str | None = Field(None, min_length=1, max_length=128)
     bar_time: datetime | int | float | str
     bar_index: int | None = None
     side: str | None = Field(None, max_length=8)
     units: int | None = Field(None, ge=1)
-    price: Decimal | None = None
+    price: Decimal | None = Field(None, allow_inf_nan=False)
     sl_price: Decimal | None = None
     tp_price: Decimal | None = None
     close_reason: str | None = Field(None, max_length=32)
