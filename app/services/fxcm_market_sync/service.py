@@ -62,6 +62,7 @@ from app.services.fxcm_market_sync.utils import (
     parse_request_payload_datetime,
 )
 from app.services.fxcm_sidecar import FXCMSidecarError
+from app.models.market_repair_outbox import MarketRepairOutbox
 from app.services.market_master import market_master_service
 from app.services.market_master import market_master_service
 
@@ -535,9 +536,23 @@ class FXCMMarketSyncService:
                 502,
                 "福汇未返回该时间段的 K 线，已取消覆盖以免误删本地数据",
             )
+        # 与 K 线修复共用 _run_priority_job 的事务，避免修复成功但漏记同步任务。
+        # 每次成功修复都追加，即使数据未变化，也允许修复生产端的历史差异。
+        outbox = MarketRepairOutbox(
+            instrument_id=instrument.id,
+            provider=instrument.provider,
+            symbol=instrument.symbol,
+            interval=state.interval,
+            price_type=state.price_type,
+            start_at=job.start_at,
+            end_at=job.end_at,
+        )
+        db.add(outbox)
+        await db.flush()
         return {
             "ok": True,
             "kind": "repair",
+            "replica_job_id": outbox.id,
             "symbol": instrument.symbol,
             "provider_symbol": instrument.provider_symbol,
             "interval": job.interval,

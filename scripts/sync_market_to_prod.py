@@ -10,8 +10,8 @@ Typical workflow (local machine with SSH tunnel to prod PG):
   # 2) Scheduled incremental push (Task Scheduler every 5-15 min)
   python scripts/sync_market_to_prod.py incremental
 
-  # 3) After repairing historical bars locally, push that range to prod
-  python scripts/sync_market_to_prod.py repair --symbol "XAU/USD" --interval 5min --start-date 2026-07-01 --end-date 2026-08-31
+  # 3) Push all pending local repairs to prod (failed jobs retry next time)
+  python scripts/sync_market_to_prod.py repair
 
   # 4) Inspect local vs remote counts
   python scripts/sync_market_to_prod.py status
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "bootstrap=one-time full copy; incremental=metadata+new bars after remote watermark; "
             "metadata=instruments+aliases only; bars=OHLCV only after watermark; "
-            "repair=push a historical symbol/interval/time range and delete remote extras; "
+            "repair=consume pending repairs (or push an explicit historical range); "
             "status=counts"
         ),
     )
@@ -169,7 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    repair_values = (args.symbol, args.interval, args.start_date, args.end_date)
+    if args.mode == "repair" and any(value is not None for value in repair_values):
+        if not all(repair_values):
+            parser.error(
+                "repair accepts no range arguments (pending queue), or all of "
+                "--symbol, --interval, --start-date and --end-date"
+            )
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -203,6 +211,11 @@ def main() -> int:
                         f"aliases={counts['alias_count']} bars={counts['bar_count']} "
                         f"latest_bar_time={counts['latest_bar_time']}"
                     )
+                queue = payload["repair_queue"]
+                print(
+                    f"[repair_queue] pending={queue['pending']} "
+                    f"failed={queue['failed']} synced={queue['synced']}"
+                )
             return exit_code
 
         if args.mode == "bootstrap":
@@ -210,26 +223,15 @@ def main() -> int:
         elif args.mode == "incremental":
             result = service.run_incremental()
         elif args.mode == "repair":
-            missing = [
-                name
-                for name, value in (
-                    ("--symbol", args.symbol),
-                    ("--interval", args.interval),
-                    ("--start-date", args.start_date),
-                    ("--end-date", args.end_date),
+            if any(value is not None for value in repair_values):
+                result = service.run_range_repair(
+                    symbol=args.symbol,
+                    interval=args.interval,
+                    start_date=args.start_date,
+                    end_date=args.end_date,
                 )
-                if not value
-            ]
-            if missing:
-                raise SystemExit(
-                    "repair mode requires " + ", ".join(missing)
-                )
-            result = service.run_range_repair(
-                symbol=args.symbol,
-                interval=args.interval,
-                start_date=args.start_date,
-                end_date=args.end_date,
-            )
+            else:
+                result = service.run_pending_repairs()
         elif args.mode == "metadata":
             from app.services.market_data_replica.types import MarketReplicaResult
 
@@ -261,7 +263,10 @@ def main() -> int:
                 f"instruments={result.instruments_upserted} "
                 f"aliases={result.aliases_upserted} bars={result.bars_upserted}"
                 + (
-                    f" deleted={result.bars_deleted}"
+                    f" deleted={result.bars_deleted} "
+                    f"jobs_succeeded={result.repair_jobs_succeeded} "
+                    f"jobs_failed={result.repair_jobs_failed} "
+                    f"jobs_pending={result.repair_jobs_pending}"
                     if result.mode == "repair"
                     else ""
                 )

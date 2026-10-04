@@ -23,6 +23,7 @@ from app.services.fxcm_market_sync.utils import (
     parse_request_payload_datetime,
 )
 from app.services.market_data_replica.types import MarketReplicaResult
+from app.models.market_repair_outbox import MarketRepairOutbox
 from app.services.market_master import market_master_service
 
 
@@ -133,7 +134,87 @@ class MarketDataReplicaService:
             return {
                 "source": self._collect_counts(source),
                 "target": self._collect_counts(target),
+                "repair_queue": self._repair_queue_counts(source),
             }
+
+    def _repair_queue_counts(self, source: Session) -> dict[str, int]:
+        pending, failed, synced = source.execute(
+            select(
+                func.count().filter(MarketRepairOutbox.synced_at.is_(None)),
+                func.count().filter(
+                    MarketRepairOutbox.synced_at.is_(None),
+                    MarketRepairOutbox.last_error.is_not(None),
+                ),
+                func.count().filter(MarketRepairOutbox.synced_at.is_not(None)),
+            ).where(MarketRepairOutbox.provider == PROVIDER)
+        ).one()
+        return {"pending": pending, "failed": failed, "synced": synced}
+
+    def run_pending_repairs(self) -> MarketReplicaResult:
+        """消费源库 outbox；生产先提交，本地后确认，崩溃后可安全重放。"""
+        result = MarketReplicaResult(mode="repair")
+        try:
+            with self._source_session() as source:
+                # 固定本轮上界，每条失败记录只尝试一次；新修复留给下次命令。
+                upper_id = source.scalar(
+                    select(func.max(MarketRepairOutbox.id)).where(
+                        MarketRepairOutbox.provider == PROVIDER,
+                        MarketRepairOutbox.synced_at.is_(None),
+                    )
+                ) or 0
+            last_id = 0
+            while last_id < upper_id:
+                with self._source_session() as source:
+                    job = source.scalar(
+                        select(MarketRepairOutbox)
+                        .where(
+                            MarketRepairOutbox.provider == PROVIDER,
+                            MarketRepairOutbox.synced_at.is_(None),
+                            MarketRepairOutbox.id > last_id,
+                            MarketRepairOutbox.id <= upper_id,
+                        )
+                        .order_by(MarketRepairOutbox.id)
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
+                    )
+                    if job is None:
+                        break
+                    last_id = job.id
+                    job.attempts += 1
+                    job.last_attempt_at = _utc_now()
+                    # 源库行锁一直持有到远端提交及本地确认完成；断连自动释放。
+                    try:
+                        upserted, deleted = self.sync_bars_range_repair(
+                            symbol=job.symbol,
+                            interval=job.interval,
+                            price_type=job.price_type,
+                            start_date=job.start_at.isoformat(),
+                            end_date=job.end_at.isoformat(),
+                        )
+                    except Exception as exc:
+                        job.last_error = f"{type(exc).__name__}: {exc}"
+                        source.commit()
+                        result.repair_jobs_failed += 1
+                        result.errors.append(f"repair job {job.id}: {job.last_error}")
+                        logger.exception("Repair replica job %s failed; retained for retry", job.id)
+                    else:
+                        job.synced_at = _utc_now()
+                        job.last_error = None
+                        job.bars_upserted = upserted
+                        job.bars_deleted = deleted
+                        source.commit()
+                        result.repair_jobs_succeeded += 1
+                        result.bars_upserted += upserted
+                        result.bars_deleted += deleted
+                        logger.info("Repair replica job %s synced", job.id)
+            with self._source_session() as source:
+                result.repair_jobs_pending = self._repair_queue_counts(source)["pending"]
+        except Exception as exc:
+            logger.exception("Market repair outbox processing failed")
+            result.errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            result.finished_at = _utc_now()
+        return result
 
     def run_bootstrap(self, *, force: bool = False) -> MarketReplicaResult:
         """一次性全量复制 instrument / alias / bar 到空远程库。"""
@@ -376,6 +457,9 @@ class MarketDataReplicaService:
         normalized_price_type = (price_type or "mid").strip().lower() or "mid"
 
         with self._source_session() as source, self._target_session() as target:
+            # 所有范围修复（含手动）先在目标库串行化，再读取本地快照。
+            # 防止并发处理重叠范围时，较旧快照最后提交覆盖较新数据。
+            target.execute(text("SELECT pg_advisory_xact_lock(724615, 1)"))
             source_instrument = source.scalars(
                 select(MarketInstrument).where(
                     MarketInstrument.provider == PROVIDER,
