@@ -54,6 +54,9 @@ class BacktestSessionView(BaseModel):
     timeframe: str | None = None
     status: str
     visibility: str
+    is_shared: bool = False
+    is_available: bool = True
+    saved_at: datetime | None = None
     start_bar_time: datetime
     start_bar_index: int | None = None
     initial_visible_bars: int

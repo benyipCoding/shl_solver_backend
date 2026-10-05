@@ -533,6 +533,21 @@ class MarketBacktestSession(Base, TimestampMixin):
     )
 
 
+class MarketBacktestBookmark(Base, TimestampMixin):
+    """A user's saved reference to a shared replay; trades remain with the owner."""
+
+    __tablename__ = "market_backtest_bookmark"
+    __table_args__ = (
+        UniqueConstraint("user_id", "session_id", name="uq_market_backtest_bookmark_user_session"),
+        Index("ix_market_backtest_bookmark_user_created", "user_id", "created_at"),
+    )
+
+    user_id = Column(Integer, ForeignKey("user.id", ondelete="CASCADE"), nullable=False)
+    session_id = Column(
+        Integer, ForeignKey("market_backtest_session.id", ondelete="CASCADE"), nullable=False,
+    )
+
+
 class MarketBacktestTrade(Base, TimestampMixin):
     """回测中的一笔持仓，从开仓到平仓占一行。
 

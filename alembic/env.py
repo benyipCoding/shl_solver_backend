@@ -12,6 +12,7 @@ from app.models.shl_solver import SHLSolverHistory
 from app.models.ai_task import AITask
 from app.models.market_repair_outbox import MarketRepairOutbox
 from app.models.market_data import (
+    MarketBacktestBookmark,
     MarketBacktestEvent,
     MarketBacktestSession,
     MarketBacktestTrade,

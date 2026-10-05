@@ -766,7 +766,7 @@ async def create_backtest_session(
     "/backtest/sessions",
     response_model=APIResponse[Any],
     summary="回测场次列表",
-    description="按创建时间倒序列出当前用户的逐K回测记录，用于历史弹窗还原播放。",
+    description="列出当前用户的回测和收藏的分享记录，按创建或收藏时间倒序排列。",
 )
 async def list_backtest_sessions(
     page: int = Query(1, ge=1, description="页码，从 1 开始"),
@@ -796,6 +796,58 @@ async def get_backtest_session(
         result = await market_backtest_service.get_session_detail(
             db, user, public_id
         )
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/backtest/sessions/{public_id}/share",
+    response_model=APIResponse[Any],
+    summary="创建或获取回测分享链接",
+)
+async def share_backtest_session(
+    public_id: str = Path(..., min_length=1, max_length=36),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.share_session(db, user, public_id)
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.delete(
+    "/backtest/sessions/{public_id}/share",
+    response_model=APIResponse[Any],
+    summary="停止分享自己的回测记录",
+)
+async def revoke_backtest_share(
+    public_id: str = Path(..., min_length=1, max_length=36),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.revoke_share(db, user, public_id)
+    except BacktestPersistError as exc:
+        return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/backtest/shared/{public_id}",
+    response_model=APIResponse[Any],
+    summary="收藏分享记录并返回回放详情",
+    description="需要登录。重复打开同一链接不会重复收藏；已移除的收藏可以重新添加。",
+)
+async def save_shared_backtest(
+    public_id: str = Path(..., min_length=1, max_length=36),
+    user: User = Depends(verify_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        result = await market_backtest_service.save_shared_session(db, user, public_id)
     except BacktestPersistError as exc:
         return _backtest_error_response(exc)
     return APIResponse(data=result)
@@ -846,7 +898,7 @@ async def complete_backtest_session(
     "/backtest/sessions/{public_id}",
     response_model=APIResponse[Any],
     summary="删除回测场次",
-    description="软删除一场回测记录。普通用户只能删除自己的场次，超级管理员可删除任意场次。",
+    description="自己的记录会软删除；来自分享的记录只移除当前用户的收藏。超级管理员可删除未收藏的任意场次。",
 )
 async def delete_backtest_session(
     public_id: str = Path(..., min_length=1, description="回测场次 public_id"),

@@ -2,11 +2,12 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.market_data import (
+    MarketBacktestBookmark,
     MarketBacktestEvent,
     MarketBacktestSession,
     MarketBacktestTrade,
@@ -196,8 +197,16 @@ class MarketBacktestService:
         user: User,
         public_id: str,
     ) -> dict:
-        session = await self._get_session_by_public_id(db, public_id)
+        session = await self._get_session_by_public_id(db, public_id, include_deleted=True)
         if session is None:
+            raise BacktestPersistError(404, "回测场次不存在")
+        if session.user_id != user.id:
+            bookmark = await self._get_bookmark(db, user.id, session.id)
+            if bookmark is not None and bookmark.deleted_at is None:
+                bookmark.deleted_at = datetime.now(timezone.utc)
+                await db.commit()
+                return {"public_id": session.public_id, "deleted": True, "removed_bookmark": True}
+        if session.deleted_at is not None:
             raise BacktestPersistError(404, "回测场次不存在")
         if not getattr(user, "is_superuser", False) and session.user_id != user.id:
             raise BacktestPersistError(403, "只能删除自己的回测记录")
@@ -234,27 +243,39 @@ class MarketBacktestService:
         page: int,
         size: int,
     ) -> dict:
-        filters = (
-            MarketBacktestSession.user_id == user.id,
-            MarketBacktestSession.deleted_at.is_(None),
+        # A saved but revoked/deleted replay stays visible so its recipient can
+        # understand why it is unavailable and remove their own bookmark.
+        bookmark_join = and_(
+            MarketBacktestBookmark.session_id == MarketBacktestSession.id,
+            MarketBacktestBookmark.user_id == user.id,
+            MarketBacktestBookmark.deleted_at.is_(None),
+        )
+        visible = or_(
+            and_(MarketBacktestSession.user_id == user.id, MarketBacktestSession.deleted_at.is_(None)),
+            MarketBacktestBookmark.id.is_not(None),
         )
         count_result = await db.execute(
             select(func.count())
             .select_from(MarketBacktestSession)
-            .where(*filters)
+            .outerjoin(MarketBacktestBookmark, bookmark_join)
+            .where(visible)
         )
         total = int(count_result.scalar() or 0)
         result = await db.execute(
-            select(MarketBacktestSession)
-            .where(*filters)
-            .order_by(MarketBacktestSession.created_at.desc())
+            select(MarketBacktestSession, MarketBacktestBookmark)
+            .outerjoin(MarketBacktestBookmark, bookmark_join)
+            .where(visible)
+            .order_by(
+                func.coalesce(MarketBacktestBookmark.created_at, MarketBacktestSession.created_at).desc(),
+                MarketBacktestSession.id.desc(),
+            )
             .offset((page - 1) * size)
             .limit(size)
         )
         return {
             "items": [
-                self._serialize_session(session)
-                for session in result.scalars().all()
+                self._serialize_session_for_user(session, user.id, bookmark)
+                for session, bookmark in result.all()
             ],
             "total": total,
             "page": page,
@@ -267,7 +288,7 @@ class MarketBacktestService:
         user: User,
         public_id: str,
     ) -> dict:
-        session = await self._get_owned_session(db, user.id, public_id)
+        session = await self._get_readable_session(db, user.id, public_id)
         trades_result = await db.execute(
             select(MarketBacktestTrade)
             .where(
@@ -288,7 +309,7 @@ class MarketBacktestService:
             )
             .order_by(MarketBacktestEvent.sequence_no.asc())
         )
-        payload = self._serialize_session(session)
+        payload = self._serialize_session_for_user(session, user.id)
         payload["trades"] = [
             self._serialize_trade(trade) for trade in trades_result.scalars().all()
         ]
@@ -297,6 +318,56 @@ class MarketBacktestService:
             for event, client_trade_id in events_result.all()
         ]
         return payload
+
+    async def share_session(self, db: AsyncSession, user: User, public_id: str) -> dict:
+        session = await self._get_readable_session(db, user.id, public_id, for_update=True)
+        if session.user_id == user.id:
+            session.visibility = "UNLISTED"
+            await db.commit()
+        return {"public_id": session.public_id, "visibility": session.visibility}
+
+    async def revoke_share(self, db: AsyncSession, user: User, public_id: str) -> dict:
+        session = await self._get_owned_session(db, user.id, public_id, for_update=True)
+        session.visibility = "PRIVATE"
+        await db.commit()
+        return {"public_id": session.public_id, "visibility": "PRIVATE"}
+
+    async def save_shared_session(self, db: AsyncSession, user: User, public_id: str) -> dict:
+        # Serializing on the source row makes repeated/concurrent imports idempotent.
+        session = await self._get_session_by_public_id(db, public_id, for_update=True)
+        if session is None or session.visibility not in {"UNLISTED", "PUBLIC"}:
+            raise BacktestPersistError(404, "分享链接无效、已停止分享或原记录已删除")
+        already_saved = session.user_id == user.id
+        if not already_saved:
+            bookmark = await self._get_bookmark(db, user.id, session.id)
+            already_saved = bookmark is not None and bookmark.deleted_at is None
+            if bookmark is None:
+                db.add(MarketBacktestBookmark(user_id=user.id, session_id=session.id))
+            elif bookmark.deleted_at is not None:
+                bookmark.deleted_at = None
+                bookmark.created_at = datetime.now(timezone.utc)
+        await db.commit()
+        detail = await self.get_session_detail(db, user, public_id)
+        return {"session": detail, "already_saved": already_saved}
+
+    async def _get_bookmark(self, db: AsyncSession, user_id: int, session_id: int):
+        result = await db.execute(select(MarketBacktestBookmark).where(
+            MarketBacktestBookmark.user_id == user_id,
+            MarketBacktestBookmark.session_id == session_id,
+        ))
+        return result.scalars().first()
+
+    async def _get_readable_session(
+        self, db: AsyncSession, user_id: int, public_id: str, *, for_update: bool = False,
+    ) -> MarketBacktestSession:
+        session = await self._get_session_by_public_id(db, public_id, for_update=for_update)
+        if session is not None and session.user_id == user_id:
+            return session
+        if session is not None and session.visibility in {"UNLISTED", "PUBLIC"}:
+            bookmark = await self._get_bookmark(db, user_id, session.id)
+            if bookmark is not None and bookmark.deleted_at is None:
+                return session
+        raise BacktestPersistError(404, "回测记录不存在或已停止分享")
 
     async def _open_trade(
         self,
@@ -584,12 +655,13 @@ class MarketBacktestService:
         return instrument
 
     async def _get_session_by_public_id(
-        self, db: AsyncSession, public_id: str, *, for_update: bool = False
+        self, db: AsyncSession, public_id: str, *, for_update: bool = False, include_deleted: bool = False,
     ) -> MarketBacktestSession | None:
         statement = select(MarketBacktestSession).where(
             MarketBacktestSession.public_id == public_id,
-            MarketBacktestSession.deleted_at.is_(None),
         )
+        if not include_deleted:
+            statement = statement.where(MarketBacktestSession.deleted_at.is_(None))
         if for_update:
             statement = statement.with_for_update()
         result = await db.execute(statement)
@@ -706,6 +778,21 @@ class MarketBacktestService:
     @staticmethod
     def _num(value) -> float | None:
         return float(value) if value is not None else None
+
+    @classmethod
+    def _serialize_session_for_user(
+        cls, session: MarketBacktestSession, user_id: int, bookmark: MarketBacktestBookmark | None = None,
+    ) -> dict:
+        payload = cls._serialize_session(session)
+        is_shared = session.user_id != user_id
+        payload.update(
+            is_shared=is_shared,
+            is_available=session.deleted_at is None and (not is_shared or session.visibility in {"UNLISTED", "PUBLIC"}),
+            saved_at=cls._iso(bookmark.created_at) if bookmark else None,
+        )
+        if is_shared:
+            payload.pop("client_session_id", None)
+        return payload
 
     @classmethod
     def _serialize_session(cls, session: MarketBacktestSession) -> dict:
