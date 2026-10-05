@@ -289,6 +289,18 @@ class MarketBacktestService:
         public_id: str,
     ) -> dict:
         session = await self._get_readable_session(db, user.id, public_id)
+        return await self._build_session_detail(db, session, user.id)
+
+    async def get_shared_session_detail(self, db: AsyncSession, public_id: str) -> dict:
+        session = await self._get_session_by_public_id(db, public_id)
+        if session is None or session.visibility not in {"UNLISTED", "PUBLIC"}:
+            raise BacktestPersistError(404, "分享链接无效、已停止分享或原记录已删除")
+        # Public previews never create bookmarks or expose the owner's client ID.
+        return await self._build_session_detail(db, session, None)
+
+    async def _build_session_detail(
+        self, db: AsyncSession, session: MarketBacktestSession, user_id: int | None,
+    ) -> dict:
         trades_result = await db.execute(
             select(MarketBacktestTrade)
             .where(
@@ -309,7 +321,7 @@ class MarketBacktestService:
             )
             .order_by(MarketBacktestEvent.sequence_no.asc())
         )
-        payload = self._serialize_session_for_user(session, user.id)
+        payload = self._serialize_session_for_user(session, user_id)
         payload["trades"] = [
             self._serialize_trade(trade) for trade in trades_result.scalars().all()
         ]
@@ -781,7 +793,7 @@ class MarketBacktestService:
 
     @classmethod
     def _serialize_session_for_user(
-        cls, session: MarketBacktestSession, user_id: int, bookmark: MarketBacktestBookmark | None = None,
+        cls, session: MarketBacktestSession, user_id: int | None, bookmark: MarketBacktestBookmark | None = None,
     ) -> dict:
         payload = cls._serialize_session(session)
         is_shared = session.user_id != user_id

@@ -148,6 +148,50 @@ class BacktestPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.visibility, "PRIVATE")
         self.assertEqual(self.sql.scalar(select(func.count()).select_from(MarketBacktestBookmark)), 0)
 
+    async def test_guest_preview_preserves_replay_without_creating_any_records(self):
+        from unittest.mock import AsyncMock, patch
+
+        await self.event("OPEN", side="BUY", units=100, price=100)
+        await self.event("CLOSE", units=40, price=110)
+        await self.service.share_session(self.db, self.user, "test-session")
+        expected = await self.service.get_session_detail(self.db, self.user, "test-session")
+        with patch.object(self.db, "commit", AsyncMock(side_effect=AssertionError("preview must not commit"))), \
+                patch.object(self.db, "add", side_effect=AssertionError("preview must not add records")):
+            for _ in range(2):
+                preview = await self.service.get_shared_session_detail(self.db, "test-session")
+                self.assertEqual(preview["events"], expected["events"])
+                self.assertEqual(preview["trades"], expected["trades"])
+                self.assertEqual(preview["start_bar_time"], expected["start_bar_time"])
+                self.assertEqual(preview["cursor_bar_time"], expected["cursor_bar_time"])
+                self.assertTrue(preview["is_shared"])
+                self.assertTrue(preview["is_available"])
+                self.assertNotIn("client_session_id", preview)
+                self.assertNotIn("user_id", preview)
+        self.assertEqual(self.sql.scalar(select(func.count()).select_from(MarketBacktestSession)), 1)
+        self.assertEqual(self.sql.scalar(select(func.count()).select_from(MarketBacktestBookmark)), 0)
+        self.assertEqual(len(self.events()), 2)
+        # Choosing to sign in and save afterwards still creates one normal bookmark.
+        result = await self.service.save_shared_session(self.db, SimpleNamespace(id=2), "test-session")
+        self.assertFalse(result["already_saved"])
+        self.assertEqual(self.sql.scalar(select(func.count()).select_from(MarketBacktestBookmark)), 1)
+
+    async def test_guest_preview_denies_private_revoked_deleted_and_unknown_links(self):
+        for public_id in ("test-session", "unknown"):
+            with self.assertRaises(BacktestPersistError) as error:
+                await self.service.get_shared_session_detail(self.db, public_id)
+            self.assertEqual(error.exception.status_code, 404)
+        await self.service.share_session(self.db, self.user, "test-session")
+        self.assertEqual((await self.service.get_shared_session_detail(self.db, "test-session"))["public_id"], "test-session")
+        await self.service.revoke_share(self.db, self.user, "test-session")
+        with self.assertRaises(BacktestPersistError):
+            await self.service.get_shared_session_detail(self.db, "test-session")
+        self.session.visibility = "PUBLIC"
+        self.sql.commit()
+        self.assertTrue((await self.service.get_shared_session_detail(self.db, "test-session"))["is_available"])
+        await self.service.delete_session(self.db, self.user, "test-session")
+        with self.assertRaises(BacktestPersistError):
+            await self.service.get_shared_session_detail(self.db, "test-session")
+
     async def test_shared_replays_do_not_grant_owner_write_permissions(self):
         recipient, _ = await self.share_with()
         stranger = SimpleNamespace(id=3)
@@ -253,14 +297,27 @@ class BacktestPersistenceTest(unittest.IsolatedAsyncioTestCase):
         share = f"{base}/sessions/test-session/share"
         imported = f"{base}/shared/test-session"
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            for method, path in (("POST", share), ("DELETE", share), ("POST", imported)):
+            for method, path in (
+                ("POST", share), ("DELETE", share), ("POST", imported),
+                ("GET", f"{base}/sessions"), ("GET", f"{base}/sessions/test-session"),
+                ("DELETE", f"{base}/sessions/test-session"),
+                ("POST", f"{base}/sessions/test-session/complete"),
+                ("POST", f"{base}/sessions/test-session/events"),
+            ):
                 self.assertEqual((await client.request(method, path)).status_code, 401)
             owner = {"x-test-user": "1"}
             recipient = {"x-test-user": "2"}
             self.assertEqual((await client.post(imported, headers=recipient)).status_code, 404)
+            self.assertEqual((await client.get(imported)).status_code, 404)
             response = await client.post(share, headers=owner)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["data"]["visibility"], "UNLISTED")
+            response = await client.get(imported)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertTrue(response.json()["data"]["is_shared"])
+            self.assertNotIn("client_session_id", response.json()["data"])
+            self.assertEqual(self.sql.scalar(select(func.count()).select_from(MarketBacktestBookmark)), 0)
             response = await client.post(imported, headers=recipient)
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.json()["data"]["session"]["is_shared"])
@@ -268,6 +325,9 @@ class BacktestPersistenceTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(listing.json()["data"]["total"], 1)
             self.assertEqual((await client.delete(share, headers=recipient)).status_code, 404)
             self.assertEqual((await client.delete(share, headers=owner)).status_code, 200)
+            response = await client.get(imported)
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.headers["cache-control"], "no-store")
             self.assertEqual((await client.get(f"{base}/sessions/test-session", headers=recipient)).status_code, 404)
             self.assertEqual((await client.delete(f"{base}/sessions/test-session", headers=recipient)).status_code, 200)
             self.assertIsNone(self.session.deleted_at)

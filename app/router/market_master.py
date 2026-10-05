@@ -1,6 +1,6 @@
 from typing import Any, Awaitable
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -832,6 +832,27 @@ async def revoke_backtest_share(
         result = await market_backtest_service.revoke_share(db, user, public_id)
     except BacktestPersistError as exc:
         return _backtest_error_response(exc)
+    return APIResponse(data=result)
+
+
+@router.get(
+    "/backtest/shared/{public_id}",
+    response_model=APIResponse[Any],
+    summary="游客查看分享回放",
+    description="无需登录，只读访问已开启分享且未删除的记录，不创建收藏。",
+)
+async def preview_shared_backtest(
+    response: Response,
+    public_id: str = Path(..., min_length=1, max_length=36),
+    db: AsyncSession = Depends(get_db),
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        result = await market_backtest_service.get_shared_session_detail(db, public_id)
+    except BacktestPersistError as exc:
+        error_response = _backtest_error_response(exc)
+        error_response.headers["Cache-Control"] = "no-store"
+        return error_response
     return APIResponse(data=result)
 
 
