@@ -30,6 +30,9 @@ class AsyncTestSession:
     async def commit(self):
         self.session.commit()
 
+    async def rollback(self):
+        self.session.rollback()
+
 
 class BacktestPersistenceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -94,6 +97,55 @@ class BacktestPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(serialized["price"])
         with self.assertRaises(BacktestPersistError):
             await self.event("MODIFY_SL")
+
+    async def test_pen_breakout_failure_close_preserves_reason_and_pnl(self):
+        await self.event("OPEN", side="BUY", units=20, price=140, sl_price=99, tp_price=550)
+        await self.event("CLOSE", units=20, price=145, close_reason="PEN_BREAKOUT_FAILED")
+        self.assertEqual(self.trade().close_reason, "PEN_BREAKOUT_FAILED")
+        self.assertEqual(self.trade().status, "CLOSED")
+        self.assertEqual(self.session.realized_pnl, Decimal(100))
+        serialized = self.service._serialize_event(self.events()[-1], "position-1")
+        self.assertEqual(serialized["close_reason"], "PEN_BREAKOUT_FAILED")
+
+    async def test_pen_short_exit_preserves_partial_fill_and_remaining_stop(self):
+        await self.event("OPEN", side="BUY", units=100, price=140, sl_price=99, tp_price=550)
+        await self.event("CLOSE", units=50, price=145, close_reason="PEN_SHORT_EXIT", client_event_id="short-exit")
+        await self.event("CLOSE", units=50, price=145, close_reason="PEN_SHORT_EXIT", client_event_id="short-exit")
+        self.assertEqual(len(self.events()), 2)
+        self.assertEqual(self.trade().status, "OPEN")
+        self.assertEqual(self.trade().sl_price, Decimal(99))
+        self.assertEqual(self.trade().tp_price, Decimal(550))
+        self.assertEqual(self.session.realized_pnl, Decimal(250))
+        serialized = self.service._serialize_event(self.events()[-1], "position-1")
+        self.assertEqual(serialized["close_reason"], "PEN_SHORT_EXIT")
+        self.assertEqual(serialized["units"], 50)
+        await self.event("MODIFY_SL", price=142)
+        await self.event("CLOSE", price=142, close_reason="SL_HIT")
+        self.assertEqual(self.trade().status, "CLOSED")
+        self.assertEqual(self.session.realized_pnl, Decimal(350))
+        self.assertEqual([e.units for e in self.events() if e.event_type == "CLOSE"], [50, 50])
+
+    async def test_batch_events_keep_order_and_match_single_event_accounting(self):
+        payloads = [
+            BacktestEventCreate(event_type="OPEN", client_trade_id="position-1", bar_time=1, side="BUY", units=20, price=100, sl_price=90),
+            BacktestEventCreate(event_type="MODIFY_SL", client_trade_id="position-1", bar_time=2, price=110),
+            BacktestEventCreate(event_type="CLOSE", client_trade_id="position-1", bar_time=3, price=110, close_reason="SL_HIT"),
+        ]
+        await self.service.record_events(self.db, self.user, "test-session", payloads)
+        self.assertEqual([e.event_type for e in self.events()], ["OPEN", "MODIFY_SL", "CLOSE"])
+        self.assertEqual([e.sequence_no for e in self.events()], [1, 2, 3])
+        self.assertEqual(self.session.realized_pnl, Decimal(200))
+        self.assertEqual(self.trade().status, "CLOSED")
+
+    async def test_invalid_batch_rolls_back_every_event(self):
+        payloads = [
+            BacktestEventCreate(event_type="OPEN", client_trade_id="position-1", bar_time=1, side="BUY", units=20, price=100),
+            BacktestEventCreate(event_type="CLOSE", client_trade_id="position-1", bar_time=2, units=21, price=110),
+        ]
+        with self.assertRaises(BacktestPersistError):
+            await self.service.record_events(self.db, self.user, "test-session", payloads)
+        self.assertEqual(self.events(), [])
+        self.assertEqual(self.sql.scalars(select(MarketBacktestTrade)).all(), [])
 
     async def test_rejects_over_close_and_force_closes_only_remainder(self):
         await self.event("OPEN", side="SELL", units=100, price=100)
@@ -307,6 +359,18 @@ class BacktestPersistenceTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await client.request(method, path)).status_code, 401)
             owner = {"x-test-user": "1"}
             recipient = {"x-test-user": "2"}
+            events_url = f"{base}/sessions/test-session/events"
+            batch = {"events": [
+                {"event_type": "OPEN", "client_trade_id": "http-batch", "bar_time": 1, "side": "BUY", "units": 10, "price": 100},
+                {"event_type": "CLOSE", "client_trade_id": "http-batch", "bar_time": 2, "price": 110},
+            ]}
+            self.assertEqual((await client.post(events_url, headers=recipient, json=batch)).status_code, 404)
+            self.assertEqual((await client.post(events_url, headers=owner, json={"events": []})).status_code, 422)
+            self.assertEqual((await client.post(events_url, headers=owner, json={"events": batch["events"] * 101})).status_code, 422)
+            response = await client.post(events_url, headers=owner, json=batch)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(response.json()["data"]), 2)
+            self.assertEqual(self.session.realized_pnl, Decimal(100))
             self.assertEqual((await client.post(imported, headers=recipient)).status_code, 404)
             self.assertEqual((await client.get(imported)).status_code, 404)
             response = await client.post(share, headers=owner)

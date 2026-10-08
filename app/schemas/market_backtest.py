@@ -37,6 +37,10 @@ class BacktestEventCreate(BaseModel):
     close_reason: str | None = Field(None, max_length=32)
 
 
+class BacktestEventsCreate(BaseModel):
+    events: list[BacktestEventCreate] = Field(..., min_length=1, max_length=200)
+
+
 class BacktestSessionComplete(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

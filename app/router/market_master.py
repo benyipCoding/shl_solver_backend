@@ -10,6 +10,7 @@ from app.depends.jwt_guard import verify_superuser, verify_user
 from app.models.user import User
 from app.schemas.market_backtest import (
     BacktestEventCreate,
+    BacktestEventsCreate,
     BacktestSessionComplete,
     BacktestSessionCreate,
 )
@@ -880,15 +881,16 @@ async def save_shared_backtest(
     summary="写入回测开仓/改价/平仓事件",
 )
 async def record_backtest_event(
-    payload: BacktestEventCreate,
+    payload: BacktestEventCreate | BacktestEventsCreate,
     public_id: str = Path(..., min_length=1, description="回测场次 public_id"),
     user: User = Depends(verify_user),
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        result = await market_backtest_service.record_event(
-            db, user, public_id, payload
-        )
+        if isinstance(payload, BacktestEventsCreate):
+            result = await market_backtest_service.record_events(db, user, public_id, payload.events)
+        else:
+            result = await market_backtest_service.record_event(db, user, public_id, payload)
     except BacktestPersistError as exc:
         return _backtest_error_response(exc)
     return APIResponse(data=result)

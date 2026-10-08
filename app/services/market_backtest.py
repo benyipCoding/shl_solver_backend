@@ -38,6 +38,8 @@ _SIDE_ALIASES = {
 }
 
 _CLOSE_REASON_ALIASES = {
+    "PEN_SHORT_EXIT": "PEN_SHORT_EXIT",
+    "PEN_BREAKOUT_FAILED": "PEN_BREAKOUT_FAILED",
     "SL_HIT": "SL_HIT",
     "SL HIT": "SL_HIT",
     "TP_HIT": "TP_HIT",
@@ -121,22 +123,33 @@ class MarketBacktestService:
         public_id: str,
         payload: BacktestEventCreate,
     ) -> dict:
+        results = await self.record_events(db, user, public_id, [payload])
+        return results[0]
+
+    async def record_events(
+        self, db: AsyncSession, user: User, public_id: str,
+        payloads: list[BacktestEventCreate],
+    ) -> list[dict]:
         session = await self._get_owned_session(db, user.id, public_id, for_update=True)
         if session.status != "RUNNING":
             raise BacktestPersistError(409, "回测场次已结束，无法再写入成交")
-
-        bar_time = self._parse_bar_time(payload.bar_time)
-        self._bump_cursor(session, bar_time, payload.bar_index)
-
-        if payload.event_type == "OPEN":
-            result = await self._open_trade(db, session, payload, bar_time)
-        elif payload.event_type in {"MODIFY_SL", "MODIFY_TP"}:
-            result = await self._modify_trade(db, session, payload, bar_time)
-        else:
-            result = await self._close_trade(db, session, payload, bar_time)
-
-        await db.commit()
-        return result
+        results = []
+        try:
+            for payload in payloads:
+                bar_time = self._parse_bar_time(payload.bar_time)
+                self._bump_cursor(session, bar_time, payload.bar_index)
+                if payload.event_type == "OPEN":
+                    result = await self._open_trade(db, session, payload, bar_time)
+                elif payload.event_type in {"MODIFY_SL", "MODIFY_TP"}:
+                    result = await self._modify_trade(db, session, payload, bar_time)
+                else:
+                    result = await self._close_trade(db, session, payload, bar_time)
+                results.append(result)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        return results
 
     async def complete_session(
         self,
