@@ -14,6 +14,7 @@ from app.router import (
     excel_workbench,
     market_master,
     market_realtime,
+    market_trading,
     shl_solver,
     wallet_credit,
 )
@@ -70,6 +71,7 @@ api_router.include_router(ai_doctor.router)
 api_router.include_router(excel_workbench.router)
 api_router.include_router(market_master.router)
 api_router.include_router(market_realtime.router)
+api_router.include_router(market_trading.router)
 api_router.include_router(shl_solver.router)
 api_router.include_router(wallet_credit.router)
 

@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     fxcm_api_base_url: str = "http://127.0.0.1:8100"
     fxcm_api_timeout_seconds: float = 60.0
     fxcm_realtime_enabled: bool = False
+    fxcm_trading_enabled: bool = False
+    fxcm_trading_bridge_key: str = ""
 
     @property
     def can_use_fxcm_realtime(self) -> bool:
