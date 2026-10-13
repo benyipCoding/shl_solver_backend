@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # FXCM sidecar
     fxcm_api_base_url: str = "http://127.0.0.1:8100"
     fxcm_api_timeout_seconds: float = 60.0
+    fxcm_realtime_enabled: bool = False
+
+    @property
+    def can_use_fxcm_realtime(self) -> bool:
+        # Explicit allow-list: never infer realtime access from hostnames.
+        return self.fxcm_realtime_enabled and self.app_env.strip().casefold() in {
+            "local", "dev", "development"
+        }
 
     # FXCM market data sync MVP
     fxcm_sync_enabled: bool = True
