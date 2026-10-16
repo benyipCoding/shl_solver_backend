@@ -19,7 +19,7 @@ router = APIRouter(prefix="/market_master/trading", tags=["Demo trading"],
 @router.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request):
     from uuid import UUID
-    valid = path in {"state", "stream"} and request.method == "GET"
+    valid = path in {"state", "stream", "history"} and request.method == "GET"
     valid = valid or path == "commands" and request.method == "POST"
     if path.startswith("commands/") and request.method == "GET":
         try:
