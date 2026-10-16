@@ -62,3 +62,17 @@ class RealtimeGatewayTest(unittest.TestCase):
         data = json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith("data: ")))
         self.assertEqual(data["candles"][0]["datetime"], "2026-10-12")
         self.assertEqual(requests[0].url.params["symbol"], "XAU/USD")
+        self.assertEqual(requests[0].url.params["snapshot_size"], "256")
+
+    def test_snapshot_size_is_bounded_and_deep_recovery_is_forwarded(self):
+        requests = []
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: (requests.append(request) or httpx.Response(200, text=": connected\n\n"))))
+        module = SimpleNamespace(market_master_service=SimpleNamespace(_resolve_fxcm_symbol=lambda symbol: symbol))
+        with patch.object(settings, "app_env", "local"), patch.object(settings, "fxcm_realtime_enabled", True), \
+                patch.dict(sys.modules, {"app.services.market_master": module}), \
+                patch("app.router.market_realtime.httpx.AsyncClient", return_value=upstream):
+            for size in (0, 5001):
+                self.assertEqual(self.client.get("/market_master/realtime/stream?symbol=EUR/USD&snapshot_size=" + str(size)).status_code, 422)
+            self.assertEqual(self.client.get("/market_master/realtime/stream?symbol=EUR/USD&snapshot_size=5000").status_code, 200)
+        self.assertEqual(requests[0].url.params["snapshot_size"], "5000")

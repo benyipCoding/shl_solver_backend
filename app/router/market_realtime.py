@@ -28,7 +28,8 @@ def normalize_event(event, interval):
 
 
 @router.get("/stream")
-async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval: str = "1h"):
+async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval: str = "1h",
+                 snapshot_size: int = Query(256, ge=2, le=5000)):
     if not settings.can_use_fxcm_realtime:
         raise HTTPException(404, "Realtime is disabled outside local development")
     if interval not in INTERVALS:
@@ -48,7 +49,7 @@ async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval
             ) as client:
                 async with client.stream(
                     "GET", settings.fxcm_api_base_url.rstrip("/") + "/realtime/stream",
-                    params={"symbol": provider_symbol, "interval": interval},
+                    params={"symbol": provider_symbol, "interval": interval, "snapshot_size": snapshot_size},
                 ) as response:
                     if response.status_code != 200:
                         yield "data: " + json.dumps({"type": "error", "retryable": response.status_code >= 500,
