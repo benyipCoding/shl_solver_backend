@@ -76,3 +76,19 @@ class RealtimeGatewayTest(unittest.TestCase):
                 self.assertEqual(self.client.get("/market_master/realtime/stream?symbol=EUR/USD&snapshot_size=" + str(size)).status_code, 422)
             self.assertEqual(self.client.get("/market_master/realtime/stream?symbol=EUR/USD&snapshot_size=5000").status_code, 200)
         self.assertEqual(requests[0].url.params["snapshot_size"], "5000")
+
+    def test_chart_seed_is_forwarded_to_sidecar(self):
+        requests = []
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: (requests.append(request) or httpx.Response(200, text="data: {\"type\":\"snapshot\"}\n\n"))))
+        module = SimpleNamespace(market_master_service=SimpleNamespace(_resolve_fxcm_symbol=lambda symbol: symbol))
+        with patch.object(settings, "app_env", "local"), patch.object(settings, "fxcm_realtime_enabled", True), \
+                patch.dict(sys.modules, {"app.services.market_master": module}), \
+                patch("app.router.market_realtime.httpx.AsyncClient", return_value=upstream):
+            response = self.client.get(
+                "/market_master/realtime/stream?symbol=EUR/USD&interval=1min"
+                "&seed_timestamp=1792184280&seed_price=1.1239"
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(requests[0].url.params["seed_timestamp"], "1792184280.0")
+        self.assertEqual(requests[0].url.params["seed_price"], "1.1239")
