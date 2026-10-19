@@ -199,7 +199,7 @@ async def get_time_series(
     interval: str = Query(
         ...,
         description=(
-            "时间粒度。当前兼容层支持 1min、5min、15min、30min、45min、1h、2h、4h、8h、1day、1week、1month。"
+            "时间粒度。当前兼容层支持 1min、5min、15min、30min、45min、1h、2h、3h、4h、6h、8h、1day、1week、1month。"
         ),
     ),
     symbol: str | None = Query(

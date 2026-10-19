@@ -64,6 +64,65 @@ class RealtimeGatewayTest(unittest.TestCase):
         self.assertEqual(requests[0].url.params["symbol"], "XAU/USD")
         self.assertEqual(requests[0].url.params["snapshot_size"], "256")
 
+    def test_history_window_forwards_to_fxcm_without_database(self):
+        values = [
+            {
+                "datetime": "2026-10-12",
+                "timestamp": 1791763200,
+                "open": 4100,
+                "high": 4200,
+                "low": 4050,
+                "close": 4150,
+            },
+            {
+                "datetime": "2026-10-13",
+                "timestamp": 1791849600,
+                "open": 4150,
+                "high": 4250,
+                "low": 4100,
+                "close": 4200,
+            },
+        ]
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "meta": {
+                        "symbol": "XAU/USD",
+                        "provider_symbol": "XAU/USD",
+                        "requested_interval": "1day",
+                        "provider_interval": "D1",
+                        "price_type": "mid",
+                    },
+                    "values": values,
+                },
+            )
+
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        module = SimpleNamespace(
+            market_master_service=SimpleNamespace(
+                _resolve_fxcm_symbol=lambda symbol: "XAU/USD"
+            )
+        )
+        with patch.object(settings, "app_env", "local"), patch.object(settings, "fxcm_realtime_enabled", True), \
+                patch.dict(sys.modules, {"app.services.market_master": module}), \
+                patch("app.router.market_realtime.httpx.AsyncClient", return_value=upstream):
+            response = self.client.get(
+                "/market_master/realtime/history?symbol=GOLD&interval=1day"
+                "&outputsize=2&end_date=2026-10-11T00:00:00Z"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["values"], values)
+        self.assertTrue(data["has_more_history"])
+        self.assertEqual(requests[0].url.params["symbol"], "XAU/USD")
+        self.assertEqual(requests[0].url.params["interval"], "1day")
+        self.assertEqual(requests[0].url.params["end_date"], "2026-10-11T00:00:00Z")
+
     def test_snapshot_size_is_bounded_and_deep_recovery_is_forwarded(self):
         requests = []
         upstream = httpx.AsyncClient(transport=httpx.MockTransport(

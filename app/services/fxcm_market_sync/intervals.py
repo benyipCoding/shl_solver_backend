@@ -35,9 +35,9 @@ def incremental_outputsize(interval: str) -> int:
     """按周期返回增量拉取建议条数。"""
     if interval in {"1week", "1day"}:
         return settings.fxcm_sync_1day_incremental_outputsize
-    if interval in {"8h", "4h"}:
+    if interval in {"8h", "6h", "4h"}:
         return max(60, settings.fxcm_sync_1h_incremental_outputsize // 2)
-    if interval == "2h":
+    if interval in {"3h", "2h"}:
         return max(100, settings.fxcm_sync_1h_incremental_outputsize)
     if interval in {"1h", "30min"}:
         return max(300, settings.fxcm_sync_1h_incremental_outputsize * 2)
@@ -52,9 +52,9 @@ def catchup_outputsize(interval: str) -> int:
         return 80
     if interval == "1day":
         return max(400, settings.fxcm_sync_1day_incremental_outputsize)
-    if interval in {"8h", "4h"}:
+    if interval in {"8h", "6h", "4h"}:
         return 600
-    if interval in {"2h", "1h"}:
+    if interval in {"3h", "2h", "1h"}:
         return 1000
     return 2000
 
@@ -67,8 +67,12 @@ def repair_outputsize(interval: str) -> int:
         return 400
     if interval == "8h":
         return 250
+    if interval == "6h":
+        return 300
     if interval == "4h":
         return 400
+    if interval == "3h":
+        return 600
     if interval == "2h":
         return 1000
     if interval == "1h":
@@ -92,8 +96,12 @@ def interval_delta(interval: str) -> timedelta:
         return timedelta(days=1)
     if interval == "8h":
         return timedelta(hours=8)
+    if interval == "6h":
+        return timedelta(hours=6)
     if interval == "4h":
         return timedelta(hours=4)
+    if interval == "3h":
+        return timedelta(hours=3)
     if interval == "2h":
         return timedelta(hours=2)
     if interval == "1h":
@@ -118,7 +126,9 @@ def sync_poll_delay(interval: str) -> timedelta:
         "30min": timedelta(minutes=30),
         "1h": timedelta(hours=1),
         "2h": timedelta(hours=2),
+        "3h": timedelta(hours=3),
         "4h": timedelta(hours=4),
+        "6h": timedelta(hours=6),
         "8h": timedelta(hours=8),
         "1day": timedelta(hours=1),
         "1week": timedelta(hours=6),

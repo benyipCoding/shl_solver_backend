@@ -78,7 +78,9 @@ FXCM Offers 表更新
 
 价格沿用原 `mid` 口径：分别更新 Bid/Ask OHLC，再取两侧对应字段的平均值。开盘沿用 `get_history()` 默认的 `PREVIOUS_CLOSE`。不凭空补出休市期间的空 K 线。
 
-周期覆盖现有 sidecar 的全部周期：1min、5min、15min、30min、45min、1h、2h、4h、8h、1day、1week、1month。其中 45min、2h、4h、8h 保持历史服务已有的 UTC 聚合边界。
+周期覆盖现有 sidecar 的全部周期：1min、5min、15min、30min、45min、1h、2h、3h、4h、6h、8h、1day、1week、1month。其中 45min、2h、3h、4h、6h、8h 使用统一的 UTC 聚合边界。
+
+实时图表向左平移到当前快照边界时，前端通过 `/market_master/realtime/history` 代理直接向 sidecar 请求带 `end_date` 的更早窗口。该路径只读 FXCM，不查询或写入本地行情数据库；SSE 继续负责最新报价和正在形成的 K 线。
 
 实际账户查询得到：日线从纽约 17:00 开始，样本为 21:00 UTC；周线示例为周六 21:00 UTC；月线示例为前一月最后一天 21:00 UTC。日/周/月根据供应商快照的锚点和纽约日历处理夏令时及月长，不能直接对 Unix 时间取固定秒数余数。对于非纽约 17:00 的原生锚点保留其 UTC 日历锚点。后端将这些周期的显示日期转换为历史接口相同的 date-only 标识，避免一根日线被前端识别为两根。
 
