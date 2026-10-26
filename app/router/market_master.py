@@ -21,7 +21,14 @@ from app.services.market_backtest import (
     BacktestPersistError,
     market_backtest_service,
 )
-from app.services.market_master import TwelveDataAPIError, market_master_service
+from app.services.market_master import (
+    MarketMasterService,
+    TwelveDataAPIError,
+    market_master_service,
+)
+
+
+MAX_KLINE_OUTPUTSIZE = MarketMasterService.MAX_TIME_SERIES_OUTPUTSIZE
 
 
 router = APIRouter(
@@ -221,8 +228,8 @@ async def get_time_series(
     outputsize: int | None = Query(
         None,
         ge=1,
-        le=5000,
-        description="返回数据点数量。当前兼容层支持范围 1 到 5000。",
+        le=MAX_KLINE_OUTPUTSIZE,
+        description=f"返回数据点数量。当前兼容层支持范围 1 到 {MAX_KLINE_OUTPUTSIZE}。",
     ),
     exchange: str | None = Query(None, description="交易所，可选。示例: NASDAQ。"),
     mic_code: str | None = Query(None, description="MIC 代码，可选。示例: XNAS。"),
@@ -258,7 +265,7 @@ async def get_time_series(
     before_count: int | None = Query(
         None,
         ge=0,
-        le=5000,
+        le=MAX_KLINE_OUTPUTSIZE,
         description="配合 around_time：在定位 K 线之前额外保留多少根上下文，默认 0。",
     ),
     after_date: str | None = Query(
@@ -591,7 +598,7 @@ async def get_kline_defaults(
     outputsize: int = Query(
         120,
         ge=1,
-        le=5000,
+        le=MAX_KLINE_OUTPUTSIZE,
         description="默认返回 120 根 K 线，可按需调小或调大。",
     ),
     exchange: str | None = Query(None, description="交易所过滤，可选。示例: NASDAQ。"),
@@ -628,7 +635,7 @@ async def get_kline_defaults(
     before_count: int | None = Query(
         None,
         ge=0,
-        le=5000,
+        le=MAX_KLINE_OUTPUTSIZE,
         description="配合 around_time：在定位 K 线之前额外保留多少根上下文，默认 0。",
     ),
     after_date: str | None = Query(

@@ -28,6 +28,8 @@ INTERVALS = {
     "1week",
     "1month",
 }
+# Matches the sidecar's MAX_OUTPUT_BARS and the frontend's KLINE_PAGE_SIZE.
+MAX_REALTIME_BARS = 20000
 
 
 @router.get("/capabilities")
@@ -48,7 +50,7 @@ def normalize_event(event, interval):
 async def history(
     symbol: str = Query(..., min_length=1, max_length=64),
     interval: str = "1h",
-    outputsize: int = Query(5000, ge=2, le=5000),
+    outputsize: int = Query(MAX_REALTIME_BARS, ge=2, le=MAX_REALTIME_BARS),
     end_date: str | None = Query(None),
 ):
     """Fetch an older FXCM window without reading or updating the database."""
@@ -130,8 +132,8 @@ async def history(
             "total": len(values),
             "offset": 0,
             # A derived interval (for example 3h/6h) can yield fewer candles
-            # than outputsize because the sidecar's raw H1 request is capped
-            # at 5000 rows. An empty page is the reliable end-of-history mark.
+            # than outputsize because the sidecar caps its raw H1 request. An
+            # empty page is the reliable end-of-history mark.
             "has_more_history": bool(values),
             "has_more_future": False,
             "earliest": earliest,
@@ -144,7 +146,7 @@ async def history(
 
 @router.get("/stream")
 async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval: str = "1h",
-                 snapshot_size: int = Query(256, ge=2, le=5000),
+                 snapshot_size: int = Query(256, ge=2, le=MAX_REALTIME_BARS),
                  seed_timestamp: float | None = Query(None, gt=0),
                  seed_price: float | None = Query(None, gt=0)):
     if not settings.can_use_fxcm_realtime:

@@ -61,6 +61,8 @@ class MarketMasterService:
     MAX_WATCHLIST_SYMBOLS = 10
     DEFAULT_KLINE_OUTPUTSIZE = 120
     DEFAULT_TIME_SERIES_OUTPUTSIZE = 120
+    # 前端一页 K 线（历史分页与实时补历史共用），需与 sidecar MAX_OUTPUT_BARS 一致。
+    MAX_TIME_SERIES_OUTPUTSIZE = 20000
     DEFAULT_KLINE_TIMEZONE = "Exchange"
     DEFAULT_KLINE_ORDER = "desc"
     DEFAULT_KLINE_PREVIOUS_CLOSE = True
@@ -866,7 +868,7 @@ class MarketMasterService:
             query_params.get("outputsize"),
             default=self.DEFAULT_TIME_SERIES_OUTPUTSIZE,
             minimum=1,
-            maximum=5000,
+            maximum=self.MAX_TIME_SERIES_OUTPUTSIZE,
         )
         history_params = self._build_fxcm_history_params(query_params)
         start_dt = self._parse_request_datetime(history_params.get("start_date"))
@@ -1164,7 +1166,7 @@ class MarketMasterService:
             query_params.get("outputsize"),
             default=self.DEFAULT_TIME_SERIES_OUTPUTSIZE,
             minimum=1,
-            maximum=5000,
+            maximum=self.MAX_TIME_SERIES_OUTPUTSIZE,
         )
         order = (
             self._to_str(query_params.get("order")) or self.DEFAULT_KLINE_ORDER
