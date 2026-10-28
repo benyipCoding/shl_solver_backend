@@ -1,28 +1,11 @@
 import asyncio
 import logging
-from collections import deque
-from datetime import datetime, timedelta
-from typing import Any
-
-from sqlalchemy import func, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.config import settings
-from app.models.market_data import (
-    MarketBarSyncState,
-    MarketInstrument,
-    MarketInstrumentAlias,
-    MarketOHLCVBar,
-)
-from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
-import asyncio
-import logging
 import math
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -46,11 +29,9 @@ from app.services.fxcm_market_sync.intervals import (
     repair_outputsize,
     resolve_sync_intervals,
 )
-from app.services.fxcm_market_sync.scheduling_policy import (
-    infer_asset_category,
-    is_allowed_today,
-)
+from app.services.fxcm_market_sync.scheduling_policy import infer_asset_category
 from app.services.fxcm_market_sync.state_sync import state_sync_handler
+from app.services.fxcm_market_sync.sync_queue import sync_queue_handler
 from app.services.fxcm_market_sync.types import (
     FXCMMarketSyncResult,
     PriorityForwardSyncError,
@@ -63,7 +44,6 @@ from app.services.fxcm_market_sync.utils import (
 )
 from app.services.fxcm_sidecar import FXCMSidecarError
 from app.models.market_repair_outbox import MarketRepairOutbox
-from app.services.market_master import market_master_service
 from app.services.market_master import market_master_service
 
 
@@ -207,7 +187,7 @@ class FXCMMarketSyncService:
         interval: str,
         outputsize: int | None = None,
     ) -> bool:
-        """本地缺数据时即时拉取，并把品种/周期注册到后台持续同步。"""
+        """本地缺数据时即时拉取并登记同步状态；品种在采集队列中才会被后台持续同步。"""
         normalized_interval = self._normalize_sync_interval(interval)
         if normalized_interval is None:
             logger.warning(
@@ -651,7 +631,11 @@ class FXCMMarketSyncService:
             dummy = FXCMMarketSyncResult(reason="priority-preempt")
             await self._drain_priority_jobs(db, dummy)
 
-        return await instrument_sync_handler.sync_instruments(db, before_each=preempt)
+        return await instrument_sync_handler.sync_instruments(
+            db,
+            symbols=await sync_queue_handler.get_queued_symbols(db),
+            before_each=preempt,
+        )
 
     async def bootstrap_sync_states(self, db: AsyncSession) -> int:
         return await state_sync_handler.bootstrap_sync_states(
@@ -672,6 +656,109 @@ class FXCMMarketSyncService:
             before_batch=self._drain_priority_jobs,
         )
 
+    # --- 采集队列 ---
+
+    async def get_sync_queue(self, db: AsyncSession) -> list[dict[str, Any]]:
+        """返回历史数据采集队列中的品种。"""
+        return [
+            {
+                "instrument_id": instrument.id,
+                "symbol": instrument.symbol,
+                "provider_symbol": instrument.provider_symbol,
+                "name": instrument.name,
+                "asset_type": instrument.asset_type,
+                "asset_category": infer_asset_category(instrument),
+                "is_active": instrument.is_active,
+                "added_at": item.created_at,
+            }
+            for item, instrument in await sync_queue_handler.list_queued_instruments(db)
+        ]
+
+    async def list_sync_candidates(
+        self,
+        db: AsyncSession,
+        *,
+        keyword: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        return await sync_queue_handler.list_candidates(
+            db, keyword=keyword, limit=limit
+        )
+
+    async def add_to_sync_queue(
+        self,
+        db: AsyncSession,
+        *,
+        symbols: list[str],
+        instrument_ids: list[int],
+    ) -> dict[str, Any]:
+        """把品种加入采集队列并立即为其创建各周期同步状态。
+
+        instrument_ids 指向本地已有品种；symbols 用于本地尚未落库、需经 sidecar 注册的品种。
+        """
+        instruments: list[MarketInstrument] = []
+        not_found: list[str] = []
+
+        if instrument_ids:
+            found = {
+                instrument.id: instrument
+                for instrument in (
+                    await db.execute(
+                        select(MarketInstrument).where(
+                            MarketInstrument.provider == self.PROVIDER,
+                            MarketInstrument.id.in_(instrument_ids),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            }
+            for instrument_id in instrument_ids:
+                instrument = found.get(instrument_id)
+                if instrument is None:
+                    not_found.append(str(instrument_id))
+                else:
+                    instruments.append(instrument)
+
+        for symbol in symbols:
+            normalized_symbol = (symbol or "").strip()
+            if not normalized_symbol:
+                continue
+            instrument = await self._ensure_instrument(db, normalized_symbol)
+            if instrument is None:
+                not_found.append(normalized_symbol)
+            else:
+                instruments.append(instrument)
+
+        added: list[str] = []
+        already_queued: list[str] = []
+        for instrument in instruments:
+            if await sync_queue_handler.add_instrument(db, instrument):
+                await state_sync_handler.ensure_instrument_states(
+                    db, instrument, sync_intervals=self.sync_intervals
+                )
+                added.append(instrument.symbol)
+            else:
+                already_queued.append(instrument.symbol)
+        await db.commit()
+
+        return {
+            "added": added,
+            "already_queued": already_queued,
+            "not_found": not_found,
+        }
+
+    async def remove_from_sync_queue(
+        self,
+        db: AsyncSession,
+        *,
+        instrument_ids: list[int],
+    ) -> dict[str, Any]:
+        """把品种移出采集队列；已采集的 K 线和同步状态保留，重新加入可续采。"""
+        removed = await sync_queue_handler.remove_instruments(db, instrument_ids)
+        await db.commit()
+        return {"removed": removed}
+
     # --- 监控接口 ---
 
     async def get_status(self, db: AsyncSession) -> dict[str, Any]:
@@ -686,7 +773,18 @@ class FXCMMarketSyncService:
         alias_count = await db.scalar(
             select(func.count()).select_from(MarketInstrumentAlias)
         )
-        bar_count = await db.scalar(select(func.count()).select_from(MarketOHLCVBar))
+        # K 线表数千万行，精确 count(*) 需全表扫描，监控页每 3 秒轮询会堆积；用统计估算值。
+        bar_count = await db.scalar(
+            text(
+                "SELECT reltuples::bigint FROM pg_class "
+                "WHERE oid = to_regclass(:table_name)"
+            ),
+            {"table_name": MarketOHLCVBar.__tablename__},
+        )
+        if bar_count is None or bar_count < 0:
+            bar_count = await db.scalar(
+                select(func.count()).select_from(MarketOHLCVBar)
+            )
         state_count = await db.scalar(
             select(func.count())
             .select_from(MarketBarSyncState)
@@ -722,12 +820,14 @@ class FXCMMarketSyncService:
         )
 
         hot_symbols = await self.get_hot_symbols(db)
+        queued_symbols = await sync_queue_handler.get_queued_symbols(db)
 
         return {
             "scheduler_enabled": settings.fxcm_sync_enabled,
             "scheduler_running": False,
             "lock_held": self.is_running(),
             "hot_symbols": hot_symbols,
+            "queued_symbols": queued_symbols,
             "metadata_interval_hours": settings.fxcm_sync_metadata_interval_hours,
             "bar_intervals": self.sync_intervals,
             "instrument_count": int(instrument_count or 0),
@@ -786,22 +886,9 @@ class FXCMMarketSyncService:
         return tasks
 
     async def get_sync_states(self, db: AsyncSession) -> dict[str, Any]:
-        """返回全部同步状态行及今日轮换策略上下文。"""
+        """返回全部同步状态行，并标记各行品种是否在采集队列中。"""
         now = utc_now()
-        weekday = now.weekday()
-        rotation_schedule = [
-            {"weekday": 0, "category": "forex", "label": "外汇"},
-            {"weekday": 1, "category": "index", "label": "指数"},
-            {"weekday": 2, "category": "commodity", "label": "大宗商品"},
-            {"weekday": 3, "category": "index", "label": "指数"},
-            {"weekday": 4, "category": "crypto", "label": "加密货币"},
-            {"weekday": 5, "category": "forex", "label": "外汇"},
-            {"weekday": 6, "category": "commodity", "label": "大宗商品"},
-        ]
-        today_rotation = next(
-            (item for item in rotation_schedule if item["weekday"] == weekday),
-            None,
-        )
+        queued_ids = await sync_queue_handler.get_queued_instrument_ids(db)
 
         stmt = (
             select(MarketBarSyncState, MarketInstrument)
@@ -820,13 +907,8 @@ class FXCMMarketSyncService:
 
         items: list[dict[str, Any]] = []
         for state, instrument in rows:
-            category = infer_asset_category(instrument)
-            allowed_today = is_allowed_today(instrument, now)
             next_sync_from = state.next_sync_from
-            if next_sync_from is None:
-                seconds_until_next_sync = 0
-                is_due = True
-            elif next_sync_from <= now:
+            if next_sync_from is None or next_sync_from <= now:
                 seconds_until_next_sync = 0
                 is_due = True
             else:
@@ -840,8 +922,8 @@ class FXCMMarketSyncService:
                     "symbol": instrument.symbol,
                     "provider_symbol": instrument.provider_symbol,
                     "asset_type": instrument.asset_type,
-                    "asset_category": category,
-                    "allowed_today": allowed_today,
+                    "asset_category": infer_asset_category(instrument),
+                    "in_queue": instrument.id in queued_ids,
                     "interval": state.interval,
                     "price_type": state.price_type,
                     "enabled": state.enabled,
@@ -867,15 +949,7 @@ class FXCMMarketSyncService:
                 }
             )
 
-        return {
-            "rotation": {
-                "weekday": weekday,
-                "today": today_rotation,
-                "schedule": rotation_schedule,
-                "server_time": now,
-            },
-            "items": items,
-        }
+        return {"server_time": now, "items": items}
 
     def _metadata_sync_due(self) -> bool:
         if self._last_metadata_sync_at is None:

@@ -33,18 +33,11 @@ async def lifespan(app: FastAPI):
         except Exception:
             print("⚠️ Redis init failed, continuing startup")
 
-    if settings.fxcm_sync_enabled and settings.is_local_development:
-        try:
-            await fxcm_market_sync_scheduler.start()
-            print("✅ FXCM market sync scheduler started")
-        except Exception:
-            print("⚠️ FXCM market sync scheduler failed to start, continuing startup")
-    elif settings.fxcm_sync_enabled:
-        print("ℹ️ FXCM market sync scheduler skipped outside local development")
+    # FXCM 历史数据定时采集不随服务启动，由 sync-status 页面手动开启。
 
     yield
 
-    if settings.fxcm_sync_enabled and settings.is_local_development:
+    if fxcm_market_sync_scheduler.is_running():
         try:
             await fxcm_market_sync_scheduler.stop()
             print("🛑 FXCM market sync scheduler stopped")

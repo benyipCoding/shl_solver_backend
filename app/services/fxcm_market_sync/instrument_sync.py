@@ -45,12 +45,13 @@ class InstrumentSyncHandler:
         self,
         db: AsyncSession,
         *,
+        symbols: list[str],
         before_each: Callable[[], Awaitable[Any]] | None = None,
     ) -> int:
-        """刷新热池品种元数据并同步别名映射。"""
+        """刷新指定品种（采集队列）的元数据并同步别名映射。"""
         synced_count = 0
         hot_symbols = await self.get_hot_symbols(db)
-        for symbol in hot_symbols:
+        for symbol in symbols:
             if before_each is not None:
                 await before_each()
             instrument_payload = await self.build_instrument_payload(

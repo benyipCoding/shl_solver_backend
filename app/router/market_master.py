@@ -14,8 +14,13 @@ from app.schemas.market_backtest import (
     BacktestSessionComplete,
     BacktestSessionCreate,
 )
+from app.schemas.market_sync import SyncQueueAddRequest, SyncQueueRemoveRequest
 from app.schemas.response import APIResponse
-from app.services.fxcm_market_sync import fxcm_market_sync_service
+from app.services.fxcm_market_sync import (
+    FXCMSchedulerControlError,
+    fxcm_market_sync_scheduler,
+    fxcm_market_sync_service,
+)
 from app.services.fxcm_market_sync.types import PriorityForwardSyncError
 from app.services.market_backtest import (
     BacktestPersistError,
@@ -355,21 +360,107 @@ async def symbol_search(
 @router.get(
     "/sync/status",
     response_model=APIResponse[Any],
-    summary="获取当前同步状态和运行中的任务",
+    summary="获取当前同步状态、采集队列与调度器运行情况",
 )
 async def get_sync_status():
     async with db_client.async_session() as db:
         status_info = await fxcm_market_sync_service.get_status(db)
+        status_info["scheduler_running"] = fxcm_market_sync_scheduler.is_running()
         running_tasks = await fxcm_market_sync_service.get_running_tasks(db)
         sync_states = await fxcm_market_sync_service.get_sync_states(db)
+        queue = await fxcm_market_sync_service.get_sync_queue(db)
         return APIResponse(
             data={
                 "status": status_info,
+                "scheduler": fxcm_market_sync_scheduler.snapshot(),
+                "queue": queue,
                 "running_tasks": running_tasks,
                 "states": sync_states["items"],
-                "rotation": sync_states["rotation"],
+                "server_time": sync_states["server_time"],
             }
         )
+
+
+@router.post(
+    "/sync/scheduler/start",
+    response_model=APIResponse[Any],
+    summary="开启历史数据定时采集",
+    description="仅超级管理员可用。只影响历史数据模式的后台采集，实时模式不受影响。",
+    dependencies=[Depends(verify_superuser)],
+)
+async def start_sync_scheduler():
+    try:
+        await fxcm_market_sync_scheduler.start()
+    except FXCMSchedulerControlError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"code": exc.status_code, "message": exc.message, "data": None},
+        )
+    return APIResponse(data=fxcm_market_sync_scheduler.snapshot())
+
+
+@router.post(
+    "/sync/scheduler/stop",
+    response_model=APIResponse[Any],
+    summary="停止历史数据定时采集",
+    description="仅超级管理员可用。正在进行的采集轮次会被中断，未提交的写入回滚。",
+    dependencies=[Depends(verify_superuser)],
+)
+async def stop_sync_scheduler():
+    await fxcm_market_sync_scheduler.stop()
+    return APIResponse(data=fxcm_market_sync_scheduler.snapshot())
+
+
+@router.get(
+    "/sync/candidates",
+    response_model=APIResponse[Any],
+    summary="列出可加入采集队列的候选品种",
+    description=(
+        "返回本地 market_instrument 中不在采集队列里的品种；"
+        "传入 keyword 时额外在 FXCM sidecar 搜索本地尚未落库的品种（source=fxcm）。"
+    ),
+)
+async def list_sync_candidates(
+    keyword: str | None = Query(None, description="按符号或名称过滤。"),
+    limit: int = Query(500, ge=1, le=2000, description="本地候选最多返回条数。"),
+):
+    async with db_client.async_session() as db:
+        result = await fxcm_market_sync_service.list_sync_candidates(
+            db, keyword=keyword, limit=limit
+        )
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/sync/queue",
+    response_model=APIResponse[Any],
+    summary="把品种加入历史数据采集队列",
+    description="仅超级管理员可用。加入后立即为各同步周期创建状态任务，调度器下一轮即开始采集。",
+    dependencies=[Depends(verify_superuser)],
+)
+async def add_to_sync_queue(payload: SyncQueueAddRequest):
+    async with db_client.async_session() as db:
+        result = await fxcm_market_sync_service.add_to_sync_queue(
+            db,
+            symbols=payload.symbols,
+            instrument_ids=payload.instrument_ids,
+        )
+    return APIResponse(data=result)
+
+
+@router.post(
+    "/sync/queue/remove",
+    response_model=APIResponse[Any],
+    summary="把品种移出历史数据采集队列",
+    description="仅超级管理员可用。已采集的 K 线和同步状态会保留，重新加入后从原进度续采。",
+    dependencies=[Depends(verify_superuser)],
+)
+async def remove_from_sync_queue(payload: SyncQueueRemoveRequest):
+    async with db_client.async_session() as db:
+        result = await fxcm_market_sync_service.remove_from_sync_queue(
+            db, instrument_ids=payload.instrument_ids
+        )
+    return APIResponse(data=result)
 
 
 @router.post(
