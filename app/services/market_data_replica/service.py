@@ -328,7 +328,10 @@ class MarketDataReplicaService:
             return {"instruments": instrument_count, "aliases": alias_count}
 
     def sync_bars_incremental(self) -> int:
-        """按远程 max(bar_time) 水位推送本地新增/更新的 K 线。"""
+        """按远程水位推送本地 K 线：比远程最新更新的、以及比远程最早更早的（回补出来的历史）。
+
+        每个序列推完即提交，避免大批量补数时出现超长事务，中途失败也不丢已推送的序列。
+        """
         total = 0
         with self._source_session() as source, self._target_session() as target:
             id_map = self._build_instrument_id_map(source, target)
@@ -356,13 +359,16 @@ class MarketDataReplicaService:
                 if target_instrument_id is None:
                     continue
 
-                remote_max_bar_time = target.scalar(
-                    select(func.max(MarketOHLCVBar.bar_time)).where(
+                remote_min_bar_time, remote_max_bar_time = target.execute(
+                    select(
+                        func.min(MarketOHLCVBar.bar_time),
+                        func.max(MarketOHLCVBar.bar_time),
+                    ).where(
                         MarketOHLCVBar.instrument_id == target_instrument_id,
                         MarketOHLCVBar.interval == interval,
                         MarketOHLCVBar.price_type == price_type,
                     )
-                )
+                ).one()
 
                 stmt = (
                     select(MarketOHLCVBar)
@@ -373,35 +379,57 @@ class MarketDataReplicaService:
                     )
                     .order_by(MarketOHLCVBar.bar_time.asc())
                 )
-                if remote_max_bar_time is not None:
+                if remote_max_bar_time is None:
+                    total += self._push_bar_pages(source, target, stmt, target_instrument_id)
+                else:
                     overlap = interval_delta(interval) * max(1, self._overlap_bars)
-                    watermark = remote_max_bar_time - overlap
-                    stmt = stmt.where(MarketOHLCVBar.bar_time >= watermark)
-
-                last_bar_time: datetime | None = None
-                while True:
-                    page_stmt = stmt
-                    if last_bar_time is not None:
-                        page_stmt = page_stmt.where(
-                            MarketOHLCVBar.bar_time > last_bar_time
-                        )
-                    rows = source.scalars(page_stmt.limit(self._batch_size)).all()
-                    if not rows:
-                        break
-
-                    payloads = []
-                    for row in rows:
-                        payload = _model_row_dict(row)
-                        payload.pop("id", None)
-                        payload["instrument_id"] = target_instrument_id
-                        payload["updated_at"] = _utc_now()
-                        payloads.append(payload)
-
-                    total += self._upsert_bars(target, payloads)
-                    last_bar_time = rows[-1].bar_time
+                    total += self._push_bar_pages(
+                        source,
+                        target,
+                        stmt.where(
+                            MarketOHLCVBar.bar_time >= remote_max_bar_time - overlap
+                        ),
+                        target_instrument_id,
+                    )
+                    total += self._push_bar_pages(
+                        source,
+                        target,
+                        stmt.where(MarketOHLCVBar.bar_time < remote_min_bar_time),
+                        target_instrument_id,
+                    )
+                target.commit()
 
             target.commit()
         return total
+
+    def _push_bar_pages(
+        self,
+        source: Session,
+        target: Session,
+        stmt: Any,
+        target_instrument_id: int,
+    ) -> int:
+        """按 bar_time 升序分页读取本地 K 线并 upsert 到远程，返回推送行数。"""
+        total = 0
+        last_bar_time: datetime | None = None
+        while True:
+            page_stmt = stmt
+            if last_bar_time is not None:
+                page_stmt = page_stmt.where(MarketOHLCVBar.bar_time > last_bar_time)
+            rows = source.scalars(page_stmt.limit(self._batch_size)).all()
+            if not rows:
+                return total
+
+            payloads = []
+            for row in rows:
+                payload = _model_row_dict(row)
+                payload.pop("id", None)
+                payload["instrument_id"] = target_instrument_id
+                payload["updated_at"] = _utc_now()
+                payloads.append(payload)
+
+            total += self._upsert_bars(target, payloads)
+            last_bar_time = rows[-1].bar_time
 
     def run_range_repair(
         self,

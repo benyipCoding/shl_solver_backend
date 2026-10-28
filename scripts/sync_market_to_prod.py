@@ -7,7 +7,8 @@ Typical workflow (local machine with SSH tunnel to prod PG):
   # 1) One-time full copy into empty remote DB (after alembic upgrade on remote)
   python scripts/sync_market_to_prod.py bootstrap
 
-  # 2) Scheduled incremental push (Task Scheduler every 5-15 min)
+  # 2) Scheduled incremental push (Task Scheduler every 5-15 min); pushes bars newer than
+  #    the remote latest and backfilled bars older than the remote earliest, committing per series
   python scripts/sync_market_to_prod.py incremental
 
   # 3) Push all pending local repairs to prod (failed jobs retry next time)
@@ -101,8 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
         "mode",
         choices=("bootstrap", "incremental", "metadata", "bars", "repair", "status"),
         help=(
-            "bootstrap=one-time full copy; incremental=metadata+new bars after remote watermark; "
-            "metadata=instruments+aliases only; bars=OHLCV only after watermark; "
+            "bootstrap=one-time full copy; incremental=metadata+bars newer than the remote latest "
+            "or older than the remote earliest bar; "
+            "metadata=instruments+aliases only; bars=OHLCV only, same watermarks as incremental; "
             "repair=consume pending repairs (or push an explicit historical range); "
             "status=counts"
         ),
