@@ -67,32 +67,6 @@ def infer_asset_category(instrument: MarketInstrument) -> str:
     return infer_category_key(instrument.asset_type, instrument.symbol)
 
 
-def is_allowed_today(instrument: MarketInstrument, current_time: datetime) -> bool:
-    """根据硬性调度策略：不同日期采集不同品类，防止单一品类霸占队列。"""
-    weekday = current_time.weekday()
-    category = infer_asset_category(instrument)
-
-    if category == "other":
-        return True
-
-    if weekday == 0:
-        return category == "forex"
-    if weekday == 1:
-        return category == "index"
-    if weekday == 2:
-        return category == "commodity"
-    if weekday == 3:
-        return category == "index"
-    if weekday == 4:
-        return category == "crypto"
-    if weekday == 5:
-        return category == "forex"
-    if weekday == 6:
-        return category == "commodity"
-
-    return True
-
-
 def weekend_resume_at(
     instrument: MarketInstrument,
     current_time: datetime,

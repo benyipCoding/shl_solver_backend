@@ -343,6 +343,25 @@ class MarketBarSyncState(Base, TimestampMixin):
     meta = Column(JSON, nullable=True, comment="同步上下文和诊断信息")
 
 
+class MarketSyncQueueItem(Base, TimestampMixin):
+    """历史数据定时采集队列：只有在队列中的品种才会被后台调度器采集。"""
+
+    __tablename__ = "market_sync_queue_item"
+    __table_args__ = (
+        UniqueConstraint(
+            "instrument_id",
+            name="uq_market_sync_queue_item_instrument",
+        ),
+    )
+
+    instrument_id = Column(
+        Integer,
+        ForeignKey("market_instrument.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="品种 ID",
+    )
+
+
 class MarketBacktestSession(Base, TimestampMixin):
     """一次「开启逐K回测 → 退出回测」对应一行。
 

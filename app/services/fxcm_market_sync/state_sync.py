@@ -11,17 +11,12 @@ from app.models.market_data import (
     MarketBarSyncState,
     MarketInstrument,
     MarketOHLCVBar,
+    MarketSyncQueueItem,
 )
 from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
 from app.services.fxcm_market_sync.constants import PROVIDER
-from app.services.fxcm_market_sync.intervals import (
-    calculate_next_sync_from,
-    state_priority,
-)
-from app.services.fxcm_market_sync.scheduling_policy import (
-    is_allowed_today,
-    weekend_resume_at,
-)
+from app.services.fxcm_market_sync.intervals import state_priority
+from app.services.fxcm_market_sync.scheduling_policy import weekend_resume_at
 from app.services.fxcm_market_sync.types import FXCMMarketSyncResult, utc_now
 
 
@@ -37,7 +32,7 @@ class StateSyncHandler:
         *,
         sync_intervals: list[str],
     ) -> int:
-        """为热池品种按周期创建或修复同步状态任务。"""
+        """为采集队列中的品种按周期创建或修复同步状态任务。"""
         disable_stmt = select(MarketBarSyncState).where(
             MarketBarSyncState.provider == PROVIDER,
             MarketBarSyncState.enabled.is_(True),
@@ -47,48 +42,74 @@ class StateSyncHandler:
         for stale in stale_states:
             stale.enabled = False
 
-        stmt = select(MarketInstrument).where(
-            MarketInstrument.provider == PROVIDER,
-            MarketInstrument.is_active.is_(True),
-            MarketInstrument.is_hot.is_(True),
+        stmt = (
+            select(MarketInstrument)
+            .join(
+                MarketSyncQueueItem,
+                MarketSyncQueueItem.instrument_id == MarketInstrument.id,
+            )
+            .where(
+                MarketInstrument.provider == PROVIDER,
+                MarketInstrument.is_active.is_(True),
+            )
         )
         instruments = (await db.execute(stmt)).scalars().all()
 
         created_count = 0
         for instrument in instruments:
-            for interval in sync_intervals:
-                exists_stmt = select(MarketBarSyncState).where(
-                    MarketBarSyncState.instrument_id == instrument.id,
-                    MarketBarSyncState.interval == interval,
-                    MarketBarSyncState.price_type == "mid",
-                )
-                existing = (await db.execute(exists_stmt)).scalars().first()
-                if existing is not None:
-                    existing.enabled = True
-                    existing.target_history_bars = settings.fxcm_sync_backfill_bars
-                    existing.priority = state_priority(interval, sync_intervals)
-                    continue
+            created_count += await self.ensure_instrument_states(
+                db, instrument, sync_intervals=sync_intervals
+            )
+        return created_count
 
-                db.add(
-                    MarketBarSyncState(
-                        instrument_id=instrument.id,
-                        provider=PROVIDER,
-                        interval=interval,
-                        price_type="mid",
-                        enabled=True,
-                        priority=state_priority(interval, sync_intervals),
-                        target_history_bars=settings.fxcm_sync_backfill_bars,
-                        sync_mode="BACKFILL",
-                        next_sync_from=calculate_next_sync_from(
-                            interval=interval,
-                            now=utc_now(),
-                            skip_weekends=False,
-                        ),
-                        backfill_completed=False,
-                        last_status="IDLE",
+    async def ensure_instrument_states(
+        self,
+        db: AsyncSession,
+        instrument: MarketInstrument,
+        *,
+        sync_intervals: list[str],
+    ) -> int:
+        """确保单个品种在每个同步周期都有启用的状态任务，返回新建数量。"""
+        existing_states = (
+            (
+                await db.execute(
+                    select(MarketBarSyncState).where(
+                        MarketBarSyncState.instrument_id == instrument.id,
+                        MarketBarSyncState.price_type == "mid",
                     )
                 )
-                created_count += 1
+            )
+            .scalars()
+            .all()
+        )
+        existing_by_interval = {state.interval: state for state in existing_states}
+
+        created_count = 0
+        for interval in sync_intervals:
+            existing = existing_by_interval.get(interval)
+            if existing is not None:
+                existing.enabled = True
+                existing.target_history_bars = settings.fxcm_sync_backfill_bars
+                existing.priority = state_priority(interval, sync_intervals)
+                continue
+
+            db.add(
+                MarketBarSyncState(
+                    instrument_id=instrument.id,
+                    provider=PROVIDER,
+                    interval=interval,
+                    price_type="mid",
+                    enabled=True,
+                    priority=state_priority(interval, sync_intervals),
+                    target_history_bars=settings.fxcm_sync_backfill_bars,
+                    sync_mode="BACKFILL",
+                    # 新加入队列的品种立即可调度，不等周期冷却（1week 冷却长达 6 小时）。
+                    next_sync_from=utc_now(),
+                    backfill_completed=False,
+                    last_status="IDLE",
+                )
+            )
+            created_count += 1
         return created_count
 
     async def sync_due_states(
@@ -101,7 +122,7 @@ class StateSyncHandler:
             Callable[[AsyncSession, FXCMMarketSyncResult], Awaitable[Any]] | None
         ) = None,
     ) -> int:
-        """挑选到期状态并逐个执行同步，记录成功失败统计。"""
+        """挑选采集队列内的到期状态并逐个执行同步，记录成功失败统计。"""
         now = utc_now()
         if before_batch is not None:
             await before_batch(db, result)
@@ -120,6 +141,10 @@ class StateSyncHandler:
             .join(
                 MarketInstrument,
                 MarketInstrument.id == MarketBarSyncState.instrument_id,
+            )
+            .join(
+                MarketSyncQueueItem,
+                MarketSyncQueueItem.instrument_id == MarketBarSyncState.instrument_id,
             )
             .outerjoin(
                 bar_count_subquery,
@@ -166,17 +191,6 @@ class StateSyncHandler:
             interval = state.interval
             price_type = state.price_type
             instrument_symbol = instrument.symbol
-
-            if not is_allowed_today(instrument, now):
-                tomorrow = (now + timedelta(days=1)).replace(
-                    hour=0, minute=5, second=0, microsecond=0
-                )
-                state.next_sync_from = tomorrow
-                state.last_status = "SKIPPED"
-                state.last_error = "Skipped by daily category rotation policy"
-                state.last_attempt_at = now
-                await db.commit()
-                continue
 
             if state.backfill_completed:
                 resume_at = weekend_resume_at(instrument, now)
