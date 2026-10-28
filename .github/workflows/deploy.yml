@@ -24,3 +24,7 @@ jobs:
             # 回到 docker-compose 所在目录，重新构建并重启后端容器
             cd ~/shl_app
             sudo docker compose up -d --build backend
+
+            # 清理被替换下来的旧镜像，以及 7 天前的构建缓存，防止磁盘被占满
+            sudo docker image prune -f
+            sudo docker builder prune -f --filter "until=168h"
