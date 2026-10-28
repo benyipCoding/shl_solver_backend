@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -11,6 +13,13 @@ class SyncQueueAddRequest(BaseModel):
         default_factory=list,
         max_length=50,
         description="本地尚未落库的 FXCM 品种符号，会先经 sidecar 注册。",
+    )
+
+
+class HistoryCutoffUpdateRequest(BaseModel):
+    cutoff_at: datetime = Field(
+        ...,
+        description="历史数据截止时间，ISO 日期时间；不带时区时按 UTC 处理。",
     )
 
 

@@ -9,7 +9,7 @@ import os
 import sys
 import unittest
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -20,7 +20,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.models.market_data import (
-    MarketBarSyncState, MarketInstrument, MarketOHLCVBar, MarketSyncQueueItem,
+    MarketBarSyncState, MarketInstrument, MarketOHLCVBar, MarketSyncConfig, MarketSyncQueueItem,
+)
+from app.services.fxcm_market_sync.bar_sync import BarSyncHandler
+from app.services.fxcm_market_sync.history_cutoff import (
+    get_forward_cursor, is_history_complete, set_forward_cursor,
 )
 from app.services.fxcm_market_sync.scheduler import (
     FXCMMarketSyncScheduler, FXCMSchedulerControlError,
@@ -74,6 +78,84 @@ class SchedulerControlTest(unittest.IsolatedAsyncioTestCase):
         service.run_cycle.assert_awaited_once()
 
 
+CUTOFF = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+
+def history_state(interval="1h", latest=None, earliest=None, backfill_completed=True, sync_mode="BACKFILL"):
+    return MarketBarSyncState(
+        instrument_id=1, provider="FXCM", interval=interval, price_type="mid", enabled=True,
+        latest_synced_bar_time=latest, earliest_synced_bar_time=earliest,
+        backfill_completed=backfill_completed, sync_mode=sync_mode, meta=None,
+    )
+
+
+class HistoryCompletionTest(unittest.TestCase):
+    def test_complete_needs_last_bar_before_cutoff_and_backfill(self):
+        self.assertTrue(is_history_complete(history_state(latest=CUTOFF - timedelta(hours=1)), CUTOFF))
+        self.assertFalse(is_history_complete(
+            history_state(latest=CUTOFF - timedelta(hours=1), backfill_completed=False), CUTOFF))
+        self.assertTrue(is_history_complete(history_state(latest=CUTOFF + timedelta(days=20)), CUTOFF))
+
+    def test_forward_cursor_covers_closed_market_gap(self):
+        # 截止时间落在周末：最后一根 K 线早于截止时间数十小时，靠游标判定已覆盖。
+        state = history_state(latest=CUTOFF - timedelta(hours=50))
+        self.assertFalse(is_history_complete(state, CUTOFF))
+        set_forward_cursor(state, CUTOFF)
+        self.assertTrue(is_history_complete(state, CUTOFF))
+        self.assertFalse(is_history_complete(state, CUTOFF + timedelta(days=7)))
+
+    def test_no_data_before_cutoff_counts_as_complete(self):
+        state = history_state(backfill_completed=False)
+        self.assertFalse(is_history_complete(state, CUTOFF))
+        set_forward_cursor(state, CUTOFF)
+        self.assertTrue(is_history_complete(state, CUTOFF))
+
+
+class SyncHistoryStateTest(unittest.IsolatedAsyncioTestCase):
+    async def run_state(self, state):
+        handler = BarSyncHandler()
+        handler._hydrate_state_from_storage = AsyncMock()
+        handler._pull_forward_bars = AsyncMock(return_value=0)
+        handler._backfill_step = AsyncMock(return_value=0)
+        await handler.sync_history_state(object(), state, object(), cutoff=CUTOFF)
+        return handler
+
+    async def test_new_state_takes_latest_batch_before_cutoff(self):
+        state = history_state(backfill_completed=False)
+        handler = await self.run_state(state)
+        kwargs = handler._pull_forward_bars.await_args.kwargs
+        self.assertIsNone(kwargs["start_date"])
+        self.assertEqual(kwargs["end_date"], CUTOFF.isoformat())
+        self.assertEqual(get_forward_cursor(state), CUTOFF)
+        handler._backfill_step.assert_awaited_once()
+
+    async def test_forward_window_is_capped_by_batch_and_cutoff(self):
+        latest = CUTOFF - timedelta(hours=5000)
+        state = history_state(latest=latest)
+        handler = await self.run_state(state)
+        window_start = latest - timedelta(hours=2)
+        window_end = window_start + timedelta(hours=2000)
+        kwargs = handler._pull_forward_bars.await_args.kwargs
+        self.assertEqual((kwargs["start_date"], kwargs["end_date"]), (window_start.isoformat(), window_end.isoformat()))
+        self.assertEqual(get_forward_cursor(state), window_end)
+        self.assertEqual(state.sync_mode, "BACKFILL")
+        self.assertIsNotNone(state.next_sync_from)
+
+        # 下一轮从游标继续，即使这段时间没有新 K 线（休市）也不会卡在原地。
+        handler = await self.run_state(state)
+        self.assertEqual(handler._pull_forward_bars.await_args.kwargs["start_date"], window_end.isoformat())
+
+    async def test_reaching_cutoff_marks_completed_without_more_pulls(self):
+        state = history_state(latest=CUTOFF - timedelta(hours=30))
+        handler = await self.run_state(state)
+        self.assertEqual(handler._pull_forward_bars.await_args.kwargs["end_date"], CUTOFF.isoformat())
+        self.assertEqual(state.sync_mode, "COMPLETED")
+        self.assertIsNone(state.next_sync_from)
+
+        handler = await self.run_state(state)
+        handler._pull_forward_bars.assert_not_awaited()
+
+
 @unittest.skipUnless(os.getenv("MARKET_SYNC_TEST_DATABASE_URL"), "isolated PostgreSQL URL required")
 class SyncQueuePostgresTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -85,7 +167,7 @@ class SyncQueuePostgresTest(unittest.IsolatedAsyncioTestCase):
         sync_engine = create_engine(
             base_url, connect_args={"options": f"-csearch_path={self.schema}"},
         )
-        for model in (MarketInstrument, MarketOHLCVBar, MarketBarSyncState):
+        for model in (MarketInstrument, MarketOHLCVBar, MarketBarSyncState, MarketSyncConfig):
             model.__table__.create(sync_engine)
         with sync_engine.begin() as conn:
             conn.execute(text(
@@ -171,15 +253,66 @@ class SyncQueuePostgresTest(unittest.IsolatedAsyncioTestCase):
 
         synced_symbols = []
 
-        async def fake_sync(db, state, instrument):
+        async def fake_sync(db, state, instrument, cutoff):
             synced_symbols.append(instrument.symbol)
             return 0
 
         with patch(
-            "app.services.fxcm_market_sync.state_sync.bar_sync_handler.sync_single_state",
+            "app.services.fxcm_market_sync.state_sync.bar_sync_handler.sync_history_state",
             side_effect=fake_sync,
         ):
             async with self.session() as db:
                 result = FXCMMarketSyncResult(reason="test")
                 await self.service.sync_due_states(db, result=result, force_due=True)
         self.assertEqual(synced_symbols, ["EUR/USD"])
+
+    async def test_cutoff_change_reconciles_and_completed_states_are_skipped(self):
+        async with self.session() as db:
+            db.add_all([
+                MarketBarSyncState(
+                    instrument_id=1, provider="FXCM", interval="5min", price_type="mid", enabled=True,
+                    priority=10, target_history_bars=1000, sync_mode="INCREMENTAL", backfill_completed=True,
+                    latest_synced_bar_time=datetime(2026, 9, 30, 23, 55, tzinfo=timezone.utc),
+                    earliest_synced_bar_time=datetime(2001, 1, 1, tzinfo=timezone.utc),
+                    last_status="SUCCESS", retry_count=0, next_sync_from=utc_now() + timedelta(hours=6),
+                ),
+            ])
+            await db.commit()
+
+        async with self.session() as db:
+            with self.assertRaises(ValueError):
+                await self.service.set_history_cutoff(db, utc_now() + timedelta(days=1))
+            result = await self.service.set_history_cutoff(db, CUTOFF)
+        self.assertEqual(result["completed"], 1)
+
+        async with self.session() as db:
+            state = (await db.execute(
+                select(MarketBarSyncState).where(MarketBarSyncState.interval == "5min")
+            )).scalars().one()
+            self.assertEqual(state.sync_mode, "COMPLETED")
+            self.assertIsNone(state.next_sync_from)
+            items = (await self.service.get_sync_states(db))["items"]
+            self.assertTrue(next(i for i in items if i["interval"] == "5min")["history_complete"])
+
+        synced = []
+
+        async def fake_sync(db, state, instrument, cutoff):
+            synced.append(state.interval)
+            return 0
+
+        with patch(
+            "app.services.fxcm_market_sync.state_sync.bar_sync_handler.sync_history_state",
+            side_effect=fake_sync,
+        ):
+            async with self.session() as db:
+                await self.service.sync_due_states(db, result=FXCMMarketSyncResult(reason="test"), force_due=True)
+        self.assertNotIn("5min", synced)
+
+        async with self.session() as db:
+            result = await self.service.set_history_cutoff(db, datetime(2026, 10, 15, tzinfo=timezone.utc))
+            self.assertEqual(result["reopened"], 1)
+            state = (await db.execute(
+                select(MarketBarSyncState).where(MarketBarSyncState.interval == "5min")
+            )).scalars().one()
+            self.assertEqual(state.sync_mode, "BACKFILL")
+            self.assertLessEqual(state.next_sync_from, utc_now())

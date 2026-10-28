@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from app.core.config import settings
 from app.services.fxcm_market_sync.constants import SUPPORTED_INTERVALS
@@ -115,37 +115,3 @@ def interval_delta(interval: str) -> timedelta:
     if interval == "1min":
         return timedelta(minutes=1)
     return timedelta(hours=1)
-
-
-def sync_poll_delay(interval: str) -> timedelta:
-    """增量模式下，各周期再次进入调度队列前的冷却时间。"""
-    poll_delays = {
-        "1min": timedelta(minutes=2),
-        "5min": timedelta(minutes=5),
-        "15min": timedelta(minutes=15),
-        "30min": timedelta(minutes=30),
-        "1h": timedelta(hours=1),
-        "2h": timedelta(hours=2),
-        "3h": timedelta(hours=3),
-        "4h": timedelta(hours=4),
-        "6h": timedelta(hours=6),
-        "8h": timedelta(hours=8),
-        "1day": timedelta(hours=1),
-        "1week": timedelta(hours=6),
-    }
-    return poll_delays.get(interval, timedelta(minutes=2))
-
-
-def calculate_next_sync_from(
-    *,
-    interval: str,
-    now: datetime,
-    skip_weekends: bool,
-) -> datetime:
-    """计算下一次调度时间，按 K 线周期设置冷却并可跳过周末。"""
-    next_sync_from = now + sync_poll_delay(interval)
-
-    while skip_weekends and next_sync_from.weekday() >= 5:
-        next_sync_from = next_sync_from + timedelta(days=1)
-
-    return next_sync_from

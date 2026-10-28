@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 PROVIDER = "FXCM"
 
-# 历史回补最早日期：不采集此日期之前的数据；已覆盖到该日期则可转增量同步。
+# 历史回补最早日期：不采集此日期之前的数据。
 BACKFILL_EARLIEST_DATE = datetime(1994, 1, 1, tzinfo=timezone.utc)
 
 SUPPORTED_INTERVALS = (
@@ -29,4 +29,12 @@ PRIORITY_REPAIR_MAX_ROUNDS = 120
 # 框选修复单次 UPSERT / DELETE 的批大小。
 REPAIR_DB_CHUNK_SIZE = 1000
 
-ALWAYS_OPEN_ASSET_TYPES = {"digital currency"}
+# 历史数据截止时间默认值（可在 sync-status 页面修改）：品种周期向前采集到截止时间、
+# 向后回补到 BACKFILL_EARLIEST_DATE，即视为采集完成，定时任务不再采集。
+DEFAULT_HISTORY_CUTOFF = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+# 定时历史采集每次向前或回补拉取的 K 线条数。
+HISTORY_BATCH_SIZE = 2000
+
+SYNC_MODE_BACKFILL = "BACKFILL"
+SYNC_MODE_COMPLETED = "COMPLETED"

@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -14,9 +14,13 @@ from app.models.market_data import (
     MarketSyncQueueItem,
 )
 from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
-from app.services.fxcm_market_sync.constants import PROVIDER
+from app.services.fxcm_market_sync.constants import (
+    PROVIDER,
+    SYNC_MODE_BACKFILL,
+    SYNC_MODE_COMPLETED,
+)
+from app.services.fxcm_market_sync.history_cutoff import is_history_complete
 from app.services.fxcm_market_sync.intervals import state_priority
-from app.services.fxcm_market_sync.scheduling_policy import weekend_resume_at
 from app.services.fxcm_market_sync.types import FXCMMarketSyncResult, utc_now
 
 
@@ -112,17 +116,50 @@ class StateSyncHandler:
             created_count += 1
         return created_count
 
+    async def reconcile_completion(
+        self,
+        db: AsyncSession,
+        *,
+        cutoff: datetime,
+    ) -> dict[str, int]:
+        """按截止时间重新判定全部状态：已覆盖的标记完成，不再覆盖的重新排入采集。"""
+        states = (
+            (
+                await db.execute(
+                    select(MarketBarSyncState).where(
+                        MarketBarSyncState.provider == PROVIDER
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        completed = 0
+        reopened = 0
+        for state in states:
+            if is_history_complete(state, cutoff):
+                if state.sync_mode != SYNC_MODE_COMPLETED:
+                    state.sync_mode = SYNC_MODE_COMPLETED
+                    state.next_sync_from = None
+                    completed += 1
+            elif state.sync_mode != SYNC_MODE_BACKFILL:
+                state.sync_mode = SYNC_MODE_BACKFILL
+                state.next_sync_from = utc_now()
+                reopened += 1
+        return {"completed": completed, "reopened": reopened}
+
     async def sync_due_states(
         self,
         db: AsyncSession,
         *,
         result: FXCMMarketSyncResult,
         force_due: bool,
+        cutoff: datetime,
         before_batch: (
             Callable[[AsyncSession, FXCMMarketSyncResult], Awaitable[Any]] | None
         ) = None,
     ) -> int:
-        """挑选采集队列内的到期状态并逐个执行同步，记录成功失败统计。"""
+        """挑选采集队列内未完成的到期状态，逐个采集历史数据并记录成功失败统计。"""
         now = utc_now()
         if before_batch is not None:
             await before_batch(db, result)
@@ -153,6 +190,7 @@ class StateSyncHandler:
             .where(
                 MarketBarSyncState.provider == PROVIDER,
                 MarketBarSyncState.enabled.is_(True),
+                MarketBarSyncState.sync_mode != SYNC_MODE_COMPLETED,
                 MarketInstrument.is_active.is_(True),
             )
             .order_by(
@@ -192,19 +230,9 @@ class StateSyncHandler:
             price_type = state.price_type
             instrument_symbol = instrument.symbol
 
-            if state.backfill_completed:
-                resume_at = weekend_resume_at(instrument, now)
-                if resume_at is not None:
-                    state.next_sync_from = resume_at
-                    state.last_status = "SKIPPED"
-                    state.last_error = None
-                    state.last_attempt_at = now
-                    await db.commit()
-                    continue
-
             try:
-                inserted = await bar_sync_handler.sync_single_state(
-                    db, state, instrument
+                inserted = await bar_sync_handler.sync_history_state(
+                    db, state, instrument, cutoff=cutoff
                 )
                 await db.commit()
                 result.rows_upserted += inserted

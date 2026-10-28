@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 
@@ -283,8 +284,8 @@ class MarketBarSyncState(Base, TimestampMixin):
     sync_mode = Column(
         String(16),
         nullable=False,
-        default="INCREMENTAL",
-        comment="同步模式，如 BACKFILL 或 INCREMENTAL",
+        default="BACKFILL",
+        comment="同步模式：BACKFILL 采集中，COMPLETED 已采集到历史截止时间",
     )
     earliest_synced_bar_time = Column(
         DateTime(timezone=True),
@@ -359,6 +360,20 @@ class MarketSyncQueueItem(Base, TimestampMixin):
         ForeignKey("market_instrument.id", ondelete="CASCADE"),
         nullable=False,
         comment="品种 ID",
+    )
+
+
+class MarketSyncConfig(Base):
+    """历史数据采集的可调配置（键值对），由 sync-status 页面修改。"""
+
+    __tablename__ = "market_sync_config"
+
+    key = Column(String(64), primary_key=True, comment="配置键")
+    value = Column(Text, nullable=False, comment="配置值")
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
 

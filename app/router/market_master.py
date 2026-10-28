@@ -14,7 +14,11 @@ from app.schemas.market_backtest import (
     BacktestSessionComplete,
     BacktestSessionCreate,
 )
-from app.schemas.market_sync import SyncQueueAddRequest, SyncQueueRemoveRequest
+from app.schemas.market_sync import (
+    HistoryCutoffUpdateRequest,
+    SyncQueueAddRequest,
+    SyncQueueRemoveRequest,
+)
 from app.schemas.response import APIResponse
 from app.services.fxcm_market_sync import (
     FXCMSchedulerControlError,
@@ -377,8 +381,33 @@ async def get_sync_status():
                 "running_tasks": running_tasks,
                 "states": sync_states["items"],
                 "server_time": sync_states["server_time"],
+                "history_cutoff_at": sync_states["history_cutoff_at"],
             }
         )
+
+
+@router.post(
+    "/sync/history-cutoff",
+    response_model=APIResponse[Any],
+    summary="设置历史数据截止时间",
+    description=(
+        "仅超级管理员可用。品种周期向前采集到该时间点、向后回补到 1994 年即视为采集完成，"
+        "定时任务不再采集；修改后立即重新判定所有同步状态。"
+    ),
+    dependencies=[Depends(verify_superuser)],
+)
+async def update_history_cutoff(payload: HistoryCutoffUpdateRequest):
+    try:
+        async with db_client.async_session() as db:
+            result = await fxcm_market_sync_service.set_history_cutoff(
+                db, payload.cutoff_at
+            )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"code": 400, "message": str(exc), "data": None},
+        )
+    return APIResponse(data=result)
 
 
 @router.post(

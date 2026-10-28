@@ -2,7 +2,7 @@ import asyncio
 import logging
 import math
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, or_, select, text
@@ -17,13 +17,18 @@ from app.models.market_data import (
 )
 from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
 from app.services.fxcm_market_sync.constants import (
+    BACKFILL_EARLIEST_DATE,
     PRIORITY_REPAIR_MAX_ROUNDS,
     PROVIDER,
     SUPPORTED_INTERVALS,
 )
+from app.services.fxcm_market_sync.history_cutoff import (
+    get_history_cutoff,
+    is_history_complete,
+    save_history_cutoff,
+)
 from app.services.fxcm_market_sync.instrument_sync import instrument_sync_handler
 from app.services.fxcm_market_sync.intervals import (
-    calculate_next_sync_from,
     interval_delta,
     normalize_sync_interval,
     repair_outputsize,
@@ -606,11 +611,7 @@ class FXCMMarketSyncService:
                 priority=0,
                 target_history_bars=resolved_target_bars,
                 sync_mode="BACKFILL",
-                next_sync_from=calculate_next_sync_from(
-                    interval=interval,
-                    now=utc_now(),
-                    skip_weekends=False,
-                ),
+                next_sync_from=utc_now(),
                 backfill_completed=False,
                 last_status="IDLE",
             )
@@ -638,9 +639,13 @@ class FXCMMarketSyncService:
         )
 
     async def bootstrap_sync_states(self, db: AsyncSession) -> int:
-        return await state_sync_handler.bootstrap_sync_states(
+        created = await state_sync_handler.bootstrap_sync_states(
             db, sync_intervals=self.sync_intervals
         )
+        await state_sync_handler.reconcile_completion(
+            db, cutoff=await get_history_cutoff(db)
+        )
+        return created
 
     async def sync_due_states(
         self,
@@ -653,8 +658,29 @@ class FXCMMarketSyncService:
             db,
             result=result,
             force_due=force_due,
+            cutoff=await get_history_cutoff(db),
             before_batch=self._drain_priority_jobs,
         )
+
+    # --- 历史数据截止时间 ---
+
+    async def set_history_cutoff(
+        self,
+        db: AsyncSession,
+        cutoff: datetime,
+    ) -> dict[str, Any]:
+        """修改历史数据截止时间，并据此重新判定所有状态是否采集完成。"""
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        if cutoff <= BACKFILL_EARLIEST_DATE:
+            raise ValueError("截止时间必须晚于历史回补下限 1994-01-01")
+        if cutoff > utc_now():
+            raise ValueError("截止时间不能晚于当前时间，最新数据请使用实时模式或同步到最新")
+
+        await save_history_cutoff(db, cutoff)
+        counts = await state_sync_handler.reconcile_completion(db, cutoff=cutoff)
+        await db.commit()
+        return {"history_cutoff_at": cutoff, **counts}
 
     # --- 采集队列 ---
 
@@ -821,6 +847,7 @@ class FXCMMarketSyncService:
 
         hot_symbols = await self.get_hot_symbols(db)
         queued_symbols = await sync_queue_handler.get_queued_symbols(db)
+        history_cutoff = await get_history_cutoff(db)
 
         return {
             "scheduler_enabled": settings.fxcm_sync_enabled,
@@ -828,6 +855,7 @@ class FXCMMarketSyncService:
             "lock_held": self.is_running(),
             "hot_symbols": hot_symbols,
             "queued_symbols": queued_symbols,
+            "history_cutoff_at": history_cutoff,
             "metadata_interval_hours": settings.fxcm_sync_metadata_interval_hours,
             "bar_intervals": self.sync_intervals,
             "instrument_count": int(instrument_count or 0),
@@ -886,9 +914,10 @@ class FXCMMarketSyncService:
         return tasks
 
     async def get_sync_states(self, db: AsyncSession) -> dict[str, Any]:
-        """返回全部同步状态行，并标记各行品种是否在采集队列中。"""
+        """返回全部同步状态行，标记各行是否在采集队列中、是否已采集到截止时间。"""
         now = utc_now()
         queued_ids = await sync_queue_handler.get_queued_instrument_ids(db)
+        cutoff = await get_history_cutoff(db)
 
         stmt = (
             select(MarketBarSyncState, MarketInstrument)
@@ -938,6 +967,7 @@ class FXCMMarketSyncService:
                     "seconds_until_next_sync": seconds_until_next_sync,
                     "is_due": is_due,
                     "backfill_completed": state.backfill_completed,
+                    "history_complete": is_history_complete(state, cutoff),
                     "last_status": state.last_status,
                     "last_attempt_at": state.last_attempt_at,
                     "last_success_at": state.last_success_at,
@@ -949,7 +979,7 @@ class FXCMMarketSyncService:
                 }
             )
 
-        return {"server_time": now, "items": items}
+        return {"server_time": now, "history_cutoff_at": cutoff, "items": items}
 
     def _metadata_sync_due(self) -> bool:
         if self._last_metadata_sync_at is None:

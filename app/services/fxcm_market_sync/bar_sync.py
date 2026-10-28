@@ -9,21 +9,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.market_data import MarketBarSyncState, MarketInstrument, MarketOHLCVBar
 from app.services.fxcm_market_sync.constants import (
-    ALWAYS_OPEN_ASSET_TYPES,
     BACKFILL_EARLIEST_DATE,
+    HISTORY_BATCH_SIZE,
     PRIORITY_FORWARD_MAX_ROUNDS,
     PRIORITY_REPAIR_MAX_ROUNDS,
     PROVIDER,
     REPAIR_DB_CHUNK_SIZE,
+    SYNC_MODE_BACKFILL,
+    SYNC_MODE_COMPLETED,
+)
+from app.services.fxcm_market_sync.history_cutoff import (
+    forward_reached,
+    get_forward_cursor,
+    is_history_complete,
+    set_forward_cursor,
 )
 from app.services.fxcm_market_sync.intervals import (
-    calculate_next_sync_from,
     catchup_outputsize,
     incremental_outputsize,
     interval_delta,
     repair_outputsize,
 )
-from app.services.fxcm_market_sync.scheduling_policy import normalize_asset_type
 from app.services.fxcm_market_sync.types import utc_now
 from app.services.fxcm_market_sync.utils import (
     coalesce_str,
@@ -46,7 +52,7 @@ class BarSyncHandler:
         state: MarketBarSyncState,
         instrument: MarketInstrument,
     ) -> int:
-        """执行单个状态的增量拉取与历史回补，并更新状态机字段。"""
+        """按需拉取：取最新一批 K 线并回补一批历史，供本地缺数据时即时展示。"""
         state.last_attempt_at = utc_now()
         state.last_status = "RUNNING"
         state.last_error = None
@@ -70,54 +76,120 @@ class BarSyncHandler:
             end_date=None,
         )
 
-        if (
-            state.earliest_synced_bar_time is not None
-            and not state.backfill_completed
-            and state.earliest_synced_bar_time > BACKFILL_EARLIEST_DATE
-        ):
-            batch_size = 2000
-            backfill_payload = {
-                "symbol": instrument.provider_symbol,
-                "interval": state.interval,
-                "outputsize": batch_size,
-                # 不请求 1994 年之前的历史，避免无意义采集。
-                "start_date": BACKFILL_EARLIEST_DATE.isoformat(),
-                "end_date": state.earliest_synced_bar_time.isoformat(),
-                "price_type": state.price_type,
-            }
+        inserted_count += await self._backfill_step(db, state, instrument)
 
-            b_payload = await fxcm_sidecar_service.get_history(**backfill_payload)
-            b_values = b_payload.get("values") if isinstance(b_payload, Mapping) else []
-            b_rows = self.build_bar_rows(
-                instrument=instrument,
-                state=state,
-                values=b_values if isinstance(b_values, list) else [],
-                meta=b_payload.get("meta") if isinstance(b_payload, Mapping) else None,
-            )
+        self._finalize_state_success(state)
+        return inserted_count
 
-            if b_rows:
-                inserted = await self.upsert_bars(db, b_rows)
-                inserted_count += inserted
-                b_bar_times = [row["bar_time"] for row in b_rows]
-                state.earliest_synced_bar_time = min_datetime(
-                    state.earliest_synced_bar_time, min(b_bar_times)
-                )
+    async def sync_history_state(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+        *,
+        cutoff: datetime,
+    ) -> int:
+        """定时历史采集：向前补到截止时间、向后回补到下限，两端都覆盖即标记完成。
 
-                if (
-                    state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE
-                    or len(b_rows) < batch_size * 0.05
-                ):
-                    state.backfill_completed = True
+        每次最多各拉一批，不会拉取截止时间之后的数据。
+        """
+        state.last_attempt_at = utc_now()
+        state.last_status = "RUNNING"
+        state.last_error = None
+
+        await self._hydrate_state_from_storage(db, state)
+
+        inserted_count = 0
+        if not forward_reached(state, cutoff):
+            delta = interval_delta(state.interval)
+            latest = state.latest_synced_bar_time
+            cursor = get_forward_cursor(state)
+            if latest is None and cursor is None:
+                # 尚无数据：取截止时间之前最近的一批，之后由回补继续向更早推进。
+                window_start = None
+                window_end = cutoff
             else:
-                state.backfill_completed = True
-        elif (
-            state.earliest_synced_bar_time is not None
-            and state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE
+                candidates = [
+                    value
+                    for value in (
+                        latest - delta * max(1, settings.fxcm_sync_incremental_overlap_bars)
+                        if latest is not None
+                        else None,
+                        cursor,
+                    )
+                    if value is not None
+                ]
+                window_start = max(candidates)
+                # sidecar 返回窗口内最新的 N 根；窗口跨度不超过 N 根才不会漏掉中间的 K 线。
+                window_end = min(cutoff, window_start + delta * HISTORY_BATCH_SIZE)
+            inserted_count += await self._pull_forward_bars(
+                db,
+                state,
+                instrument,
+                outputsize=HISTORY_BATCH_SIZE,
+                start_date=window_start.isoformat() if window_start else None,
+                end_date=window_end.isoformat(),
+            )
+            set_forward_cursor(state, window_end)
+
+        inserted_count += await self._backfill_step(db, state, instrument)
+
+        complete = is_history_complete(state, cutoff)
+        state.last_success_at = utc_now()
+        state.last_status = "SUCCESS"
+        state.retry_count = 0
+        state.sync_mode = SYNC_MODE_COMPLETED if complete else SYNC_MODE_BACKFILL
+        state.next_sync_from = None if complete else utc_now() + timedelta(seconds=120)
+        state.updated_at = utc_now()
+        return inserted_count
+
+    async def _backfill_step(
+        self,
+        db: AsyncSession,
+        state: MarketBarSyncState,
+        instrument: MarketInstrument,
+    ) -> int:
+        """向 BACKFILL_EARLIEST_DATE 回补一批更早的 K 线，并判定回补是否完成。"""
+        if state.earliest_synced_bar_time is None or state.backfill_completed:
+            return 0
+        if state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE:
+            state.backfill_completed = True
+            return 0
+
+        backfill_payload = {
+            "symbol": instrument.provider_symbol,
+            "interval": state.interval,
+            "outputsize": HISTORY_BATCH_SIZE,
+            # 不请求 1994 年之前的历史，避免无意义采集。
+            "start_date": BACKFILL_EARLIEST_DATE.isoformat(),
+            "end_date": state.earliest_synced_bar_time.isoformat(),
+            "price_type": state.price_type,
+        }
+
+        b_payload = await fxcm_sidecar_service.get_history(**backfill_payload)
+        b_values = b_payload.get("values") if isinstance(b_payload, Mapping) else []
+        b_rows = self.build_bar_rows(
+            instrument=instrument,
+            state=state,
+            values=b_values if isinstance(b_values, list) else [],
+            meta=b_payload.get("meta") if isinstance(b_payload, Mapping) else None,
+        )
+
+        if not b_rows:
+            state.backfill_completed = True
+            return 0
+
+        inserted = await self.upsert_bars(db, b_rows)
+        b_bar_times = [row["bar_time"] for row in b_rows]
+        state.earliest_synced_bar_time = min_datetime(
+            state.earliest_synced_bar_time, min(b_bar_times)
+        )
+        if (
+            state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE
+            or len(b_rows) < HISTORY_BATCH_SIZE * 0.05
         ):
             state.backfill_completed = True
-
-        self._finalize_state_success(state, instrument)
-        return inserted_count
+        return inserted
 
     async def sync_forward_only(
         self,
@@ -179,7 +251,7 @@ class BarSyncHandler:
 
                 now = utc_now()
 
-        self._finalize_state_success(state, instrument)
+        self._finalize_state_success(state)
         return inserted_count
 
     async def sync_range_repair(
@@ -501,27 +573,13 @@ class BarSyncHandler:
         state.last_requested_end_at = parse_request_payload_datetime(end_date)
         return inserted
 
-    def _finalize_state_success(
-        self,
-        state: MarketBarSyncState,
-        instrument: MarketInstrument,
-    ) -> None:
-        """将状态机标为成功，并按是否已完成历史回补设置下次调度时间。"""
+    def _finalize_state_success(self, state: MarketBarSyncState) -> None:
+        """按需拉取 / 追赶成功后标记状态；是否采集完成交给定时历史采集下一轮判定。"""
         state.last_success_at = utc_now()
         state.last_status = "SUCCESS"
         state.retry_count = 0
-        state.sync_mode = "INCREMENTAL" if state.backfill_completed else "BACKFILL"
-
-        if state.backfill_completed:
-            state.next_sync_from = calculate_next_sync_from(
-                interval=state.interval,
-                now=utc_now(),
-                skip_weekends=normalize_asset_type(instrument.asset_type)
-                not in ALWAYS_OPEN_ASSET_TYPES,
-            )
-        else:
-            state.next_sync_from = utc_now() + timedelta(seconds=120)
-
+        if state.sync_mode != SYNC_MODE_COMPLETED:
+            state.next_sync_from = utc_now()
         state.updated_at = utc_now()
 
     async def _hydrate_state_from_storage(

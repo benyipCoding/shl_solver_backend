@@ -20,6 +20,7 @@ from app.models.market_data import (
     MarketInstrument,
     MarketInstrumentAlias,
     MarketOHLCVBar,
+    MarketSyncConfig,
     MarketSyncQueueItem,
 )
 from app.core.config import settings

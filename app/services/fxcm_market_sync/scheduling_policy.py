@@ -1,7 +1,4 @@
-from datetime import datetime, timedelta
-
 from app.models.market_data import MarketInstrument
-from app.services.fxcm_market_sync.constants import ALWAYS_OPEN_ASSET_TYPES
 
 
 def normalize_asset_type(asset_type: str | None) -> str | None:
@@ -63,26 +60,5 @@ def infer_category_key(asset_type: str | None, symbol: str | None = None) -> str
 
 
 def infer_asset_category(instrument: MarketInstrument) -> str:
-    """根据资产类型或符号推断品类，用于每日轮换策略。"""
+    """根据资产类型或符号推断品类，用于页面分组展示。"""
     return infer_category_key(instrument.asset_type, instrument.symbol)
-
-
-def weekend_resume_at(
-    instrument: MarketInstrument,
-    current_time: datetime,
-) -> datetime | None:
-    """若非 7x24 品种且当前在周末，返回下周一恢复时间。"""
-    asset_type = normalize_asset_type(instrument.asset_type)
-    if asset_type in ALWAYS_OPEN_ASSET_TYPES:
-        return None
-    if current_time.weekday() < 5:
-        return None
-
-    days_until_monday = 7 - current_time.weekday()
-    monday = (current_time + timedelta(days=days_until_monday)).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    return monday
