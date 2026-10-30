@@ -5,8 +5,8 @@ PROVIDER = "FXCM"
 # 历史回补最早日期：不采集此日期之前的数据。
 BACKFILL_EARLIEST_DATE = datetime(1994, 1, 1, tzinfo=timezone.utc)
 
+# 历史采集周期；实时网关独立保留 1min，旧 1min K 线不删除。
 SUPPORTED_INTERVALS = (
-    "1min",
     "5min",
     "15min",
     "30min",

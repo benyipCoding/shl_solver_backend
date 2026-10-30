@@ -16,6 +16,7 @@ from app.models.market_data import (
 from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
 from app.services.fxcm_market_sync.constants import (
     PROVIDER,
+    SUPPORTED_INTERVALS,
     SYNC_MODE_BACKFILL,
     SYNC_MODE_COMPLETED,
 )
@@ -127,7 +128,8 @@ class StateSyncHandler:
             (
                 await db.execute(
                     select(MarketBarSyncState).where(
-                        MarketBarSyncState.provider == PROVIDER
+                        MarketBarSyncState.provider == PROVIDER,
+                        MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
                     )
                 )
             )
@@ -168,7 +170,10 @@ class StateSyncHandler:
                 MarketOHLCVBar.instrument_id.label("instrument_id"),
                 func.count().label("bar_count"),
             )
-            .where(MarketOHLCVBar.provider == PROVIDER)
+            .where(
+                MarketOHLCVBar.provider == PROVIDER,
+                MarketOHLCVBar.interval.in_(SUPPORTED_INTERVALS),
+            )
             .group_by(MarketOHLCVBar.instrument_id)
             .subquery()
         )
@@ -189,6 +194,7 @@ class StateSyncHandler:
             )
             .where(
                 MarketBarSyncState.provider == PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
                 MarketBarSyncState.enabled.is_(True),
                 MarketBarSyncState.sync_mode != SYNC_MODE_COMPLETED,
                 MarketInstrument.is_active.is_(True),

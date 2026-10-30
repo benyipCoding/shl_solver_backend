@@ -215,7 +215,7 @@ async def get_time_series(
     interval: str = Query(
         ...,
         description=(
-            "时间粒度。当前兼容层支持 1min、5min、15min、30min、45min、1h、2h、3h、4h、6h、8h、1day、1week、1month。"
+            "历史数据时间粒度，从 5min 起；1min 仅在实时模式下可用。"
         ),
     ),
     symbol: str | None = Query(
@@ -713,7 +713,7 @@ async def get_kline_defaults(
     symbol: str = Query(..., description="标的代码。示例: AAPL、EUR/USD、BTC/USD。"),
     interval: str = Query(
         "1day",
-        description="K 线粒度，默认 1day。常见值如 1min、5min、1h、1day、1week。",
+        description="历史 K 线粒度，默认 1day。常见值如 5min、1h、1day、1week；1min 仅在实时模式下可用。",
     ),
     outputsize: int = Query(
         120,

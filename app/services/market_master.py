@@ -861,6 +861,11 @@ class MarketMasterService:
         requested_interval = self._resolve_interval_name(
             self._to_str(query_params.get("interval")) or "1day"
         )
+        if requested_interval == "1min":
+            raise TwelveDataAPIError(
+                status_code=400,
+                message="历史数据模式不再支持 1min 周期，请使用 5min 或更长周期；实时模式仍支持 1min。",
+            )
 
         symbol = self._resolve_fxcm_symbol(self._extract_identifier(query_params))
         normalized_symbol = self._normalize_lookup(symbol)

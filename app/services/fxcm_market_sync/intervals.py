@@ -41,7 +41,7 @@ def incremental_outputsize(interval: str) -> int:
         return max(100, settings.fxcm_sync_1h_incremental_outputsize)
     if interval in {"1h", "30min"}:
         return max(300, settings.fxcm_sync_1h_incremental_outputsize * 2)
-    if interval in {"15min", "5min", "1min"}:
+    if interval in {"15min", "5min"}:
         return max(500, settings.fxcm_sync_1h_incremental_outputsize * 3)
     return settings.fxcm_sync_1h_incremental_outputsize
 

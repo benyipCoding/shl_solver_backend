@@ -814,13 +814,17 @@ class FXCMMarketSyncService:
         state_count = await db.scalar(
             select(func.count())
             .select_from(MarketBarSyncState)
-            .where(MarketBarSyncState.provider == self.PROVIDER)
+            .where(
+                MarketBarSyncState.provider == self.PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
+            )
         )
         enabled_state_count = await db.scalar(
             select(func.count())
             .select_from(MarketBarSyncState)
             .where(
                 MarketBarSyncState.provider == self.PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
                 MarketBarSyncState.enabled.is_(True),
             )
         )
@@ -829,6 +833,7 @@ class FXCMMarketSyncService:
             .select_from(MarketBarSyncState)
             .where(
                 MarketBarSyncState.provider == self.PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
                 MarketBarSyncState.enabled.is_(True),
                 or_(
                     MarketBarSyncState.next_sync_from.is_(None),
@@ -841,6 +846,7 @@ class FXCMMarketSyncService:
             .select_from(MarketBarSyncState)
             .where(
                 MarketBarSyncState.provider == self.PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
                 MarketBarSyncState.last_status == "FAILED",
             )
         )
@@ -889,7 +895,11 @@ class FXCMMarketSyncService:
                 MarketInstrument,
                 MarketInstrument.id == MarketBarSyncState.instrument_id,
             )
-            .where(MarketBarSyncState.last_status == "RUNNING")
+            .where(
+                MarketBarSyncState.provider == self.PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
+                MarketBarSyncState.last_status == "RUNNING",
+            )
             .order_by(MarketBarSyncState.last_attempt_at.desc())
             .limit(50)
         )
@@ -914,7 +924,7 @@ class FXCMMarketSyncService:
         return tasks
 
     async def get_sync_states(self, db: AsyncSession) -> dict[str, Any]:
-        """返回全部同步状态行，标记各行是否在采集队列中、是否已采集到截止时间。"""
+        """返回支持的历史周期状态，标记是否在采集队列中、是否已采集到截止时间。"""
         now = utc_now()
         queued_ids = await sync_queue_handler.get_queued_instrument_ids(db)
         cutoff = await get_history_cutoff(db)
@@ -925,7 +935,10 @@ class FXCMMarketSyncService:
                 MarketInstrument,
                 MarketInstrument.id == MarketBarSyncState.instrument_id,
             )
-            .where(MarketBarSyncState.provider == self.PROVIDER)
+            .where(
+                MarketBarSyncState.provider == self.PROVIDER,
+                MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
+            )
             .order_by(
                 MarketInstrument.symbol.asc(),
                 MarketBarSyncState.priority.asc(),

@@ -68,7 +68,6 @@ DEFAULT_SEARCH_KEYWORDS = (
 )
 
 INTERVALS = (
-    ("1min", 10),
     ("5min", 20),
     ("15min", 30),
     ("30min", 40),

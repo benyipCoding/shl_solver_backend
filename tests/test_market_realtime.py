@@ -151,3 +151,17 @@ class RealtimeGatewayTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(requests[0].url.params["seed_timestamp"], "1792184280.0")
         self.assertEqual(requests[0].url.params["seed_price"], "1.1239")
+
+    def test_one_minute_realtime_history_remains_available(self):
+        requests = []
+        values = [{"datetime": "2026-10-12T21:01:00+00:00", "open": 1, "high": 2, "low": 1, "close": 2}]
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: (requests.append(request) or httpx.Response(200, json={"values": values}))))
+        module = SimpleNamespace(market_master_service=SimpleNamespace(_resolve_fxcm_symbol=lambda symbol: symbol))
+        with patch.object(settings, "app_env", "local"), patch.object(settings, "fxcm_realtime_enabled", True), \
+                patch.dict(sys.modules, {"app.services.market_master": module}), \
+                patch("app.router.market_realtime.httpx.AsyncClient", return_value=upstream):
+            response = self.client.get("/market_master/realtime/history?symbol=EUR/USD&interval=1min&outputsize=2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(requests[0].url.params["interval"], "1min")
+        self.assertEqual(response.json()["data"]["values"], values)

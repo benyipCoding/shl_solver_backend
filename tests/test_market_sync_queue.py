@@ -20,7 +20,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.models.market_data import (
-    MarketBarSyncState, MarketInstrument, MarketOHLCVBar, MarketSyncConfig, MarketSyncQueueItem,
+    MarketBarSyncState, MarketInstrument, MarketInstrumentAlias, MarketOHLCVBar, MarketSyncConfig, MarketSyncQueueItem,
 )
 from app.services.fxcm_market_sync.bar_sync import BarSyncHandler
 from app.services.fxcm_market_sync.history_cutoff import (
@@ -30,7 +30,10 @@ from app.services.fxcm_market_sync.scheduler import (
     FXCMMarketSyncScheduler, FXCMSchedulerControlError,
 )
 from app.services.fxcm_market_sync.service import FXCMMarketSyncService
-from app.services.fxcm_market_sync.types import FXCMMarketSyncResult, utc_now
+from app.services.fxcm_market_sync.types import FXCMMarketSyncResult, PriorityForwardSyncError, utc_now
+from app.services.fxcm_market_sync.constants import SUPPORTED_INTERVALS
+from app.services.fxcm_market_sync.intervals import normalize_sync_interval, resolve_sync_intervals
+from app.services.market_master import MarketMasterService, TwelveDataAPIError
 
 
 if sys.platform == "win32":
@@ -76,6 +79,37 @@ class SchedulerControlTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(scheduler.snapshot()["running"])
         self.assertIsNone(scheduler.snapshot()["started_at"])
         service.run_cycle.assert_awaited_once()
+
+
+class HistoricalIntervalTest(unittest.IsolatedAsyncioTestCase):
+    def test_legacy_config_cannot_enable_one_minute_collection(self):
+        for alias in ("1min", "1m", "m1", "M1"):
+            self.assertIsNone(normalize_sync_interval(alias))
+            self.assertEqual(resolve_sync_intervals(f"{alias},M5,H1"), ["5min", "1h"])
+        self.assertNotIn("1min", resolve_sync_intervals("1min"))
+        self.assertEqual(resolve_sync_intervals(""), list(SUPPORTED_INTERVALS))
+
+    async def test_manual_and_on_demand_collection_reject_m1_before_database_access(self):
+        service = FXCMMarketSyncService()
+        for alias in ("1min", "1m", "m1", "M1"):
+            self.assertFalse(await service.fetch_on_demand_and_register(None, "EUR/USD", alias))
+            with self.assertRaises(PriorityForwardSyncError) as error:
+                await service.request_priority_forward_sync(None, "EUR/USD", alias)
+            self.assertEqual(error.exception.status_code, 400)
+            with self.assertRaises(PriorityForwardSyncError):
+                await service.request_priority_range_repair(
+                    None, "EUR/USD", alias, "2026-01-01", "2026-01-02"
+                )
+
+    async def test_history_reads_reject_m1_aliases_even_if_bars_already_exist(self):
+        service = MarketMasterService()
+        for alias in ("1min", "1m", "m1", "M1"):
+            with self.assertRaises(TwelveDataAPIError) as error:
+                await service.get_kline_defaults(symbol="EUR/USD", interval=alias)
+            self.assertEqual(error.exception.status_code, 400)
+            with self.assertRaises(TwelveDataAPIError) as error:
+                await service.get_time_series({"symbol": "EUR/USD", "interval": alias})
+            self.assertEqual(error.exception.status_code, 400)
 
 
 CUTOFF = datetime(2026, 10, 1, tzinfo=timezone.utc)
@@ -167,7 +201,7 @@ class SyncQueuePostgresTest(unittest.IsolatedAsyncioTestCase):
         sync_engine = create_engine(
             base_url, connect_args={"options": f"-csearch_path={self.schema}"},
         )
-        for model in (MarketInstrument, MarketOHLCVBar, MarketBarSyncState, MarketSyncConfig):
+        for model in (MarketInstrument, MarketInstrumentAlias, MarketOHLCVBar, MarketBarSyncState, MarketSyncConfig):
             model.__table__.create(sync_engine)
         with sync_engine.begin() as conn:
             conn.execute(text(
@@ -265,6 +299,42 @@ class SyncQueuePostgresTest(unittest.IsolatedAsyncioTestCase):
                 result = FXCMMarketSyncResult(reason="test")
                 await self.service.sync_due_states(db, result=result, force_due=True)
         self.assertEqual(synced_symbols, ["EUR/USD"])
+
+    async def test_legacy_m1_states_are_hidden_and_never_scheduled_but_bars_are_kept(self):
+        async with self.session() as db:
+            legacy = MarketBarSyncState(
+                instrument_id=1, provider="FXCM", interval="1min", price_type="mid", enabled=True,
+                priority=1, target_history_bars=1000, sync_mode="BACKFILL", backfill_completed=False,
+                last_status="RUNNING", retry_count=0, next_sync_from=utc_now() - timedelta(minutes=1),
+            )
+            db.add(legacy)
+            bar = MarketOHLCVBar(
+                instrument_id=1, provider="FXCM", provider_symbol="EUR/USD", interval="1min", price_type="mid",
+                bar_time=CUTOFF, open=1, high=2, low=1, close=2,
+            )
+            db.add(bar)
+            await db.commit()
+            legacy_id, bar_id = legacy.id, bar.id
+
+        synced = []
+        async def fake_sync(db, state, instrument, cutoff):
+            synced.append(state.interval)
+            return 0
+
+        with patch("app.services.fxcm_market_sync.state_sync.bar_sync_handler.sync_history_state", side_effect=fake_sync):
+            async with self.session() as db:
+                # Force scheduling before bootstrap: an old enabled task must already be ignored.
+                await self.service.sync_due_states(db, result=FXCMMarketSyncResult(reason="test"), force_due=True)
+                self.assertEqual(synced, ["1h"])
+                self.assertEqual([row["interval"] for row in (await self.service.get_sync_states(db))["items"]], ["1h"])
+                self.assertEqual(await self.service.get_running_tasks(db), [])
+                status = await self.service.get_status(db)
+                self.assertEqual(status["state_count"], 1)
+                self.assertEqual(status["enabled_state_count"], 1)
+                await self.service.bootstrap_sync_states(db)
+                await db.commit()
+                self.assertFalse((await db.get(MarketBarSyncState, legacy_id)).enabled)
+                self.assertIsNotNone(await db.get(MarketOHLCVBar, bar_id))
 
     async def test_cutoff_change_reconciles_and_completed_states_are_skipped(self):
         async with self.session() as db:
