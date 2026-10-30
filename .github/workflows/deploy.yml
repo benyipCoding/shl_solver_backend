@@ -17,9 +17,11 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           command_timeout: 30m
           script: |
+            set -e
+
             # 进入后端目录并拉取最新代码
             cd ~/shl_app/backend
-            git pull origin main
+            git pull --ff-only origin main
             
             # 回到 docker-compose 所在目录，重新构建并重启后端容器
             cd ~/shl_app
