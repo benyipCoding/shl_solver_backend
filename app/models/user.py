@@ -57,6 +57,9 @@ class CreditType(str, enum.Enum):
 class UserCreditLog(Base, TimestampMixin):
     __tablename__ = "user_credit_log"
 
+    operator_user_id = Column(Integer, nullable=True, comment="管理员操作人 ID")
+    reason = Column(String(500), nullable=True, comment="管理员调整原因")
+
     user_id = Column(
         BigInteger,
         index=True,

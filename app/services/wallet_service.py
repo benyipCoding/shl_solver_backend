@@ -13,6 +13,49 @@ class InsufficientCreditsException(Exception):
 
 
 class WalletService:
+    async def deduct_admin_credit(
+        self, db: AsyncSession, user_id: int, amount: int,
+        credit_type: CreditType, reason: str, operator_user_id: int,
+    ) -> dict:
+        """Deduct one credit pool and its audit log in the same locked transaction."""
+        if type(amount) is not int or not 0 < amount <= 2147483647:
+            raise HTTPException(status_code=422, detail="扣减数量必须为正整数")
+        if credit_type not in (CreditType.FREE, CreditType.PAID):
+            raise HTTPException(status_code=422, detail="无效的算力类型")
+        reason = reason.strip()
+        if not reason or len(reason) > 500:
+            raise HTTPException(status_code=422, detail="请填写 1–500 字的扣减原因")
+        try:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if user is None:
+                raise HTTPException(status_code=404, detail="用户不存在")
+            wallet = await self._get_wallet_for_update(db, user_id)
+            field = "free_credits" if credit_type == CreditType.FREE else "paid_credits"
+            available = getattr(wallet, field) if wallet is not None else 0
+            if amount > available:
+                label = "免费" if credit_type == CreditType.FREE else "付费"
+                raise HTTPException(status_code=409, detail=f"{label}算力余额不足，当前可扣减 {available} 点")
+            setattr(wallet, field, available - amount)
+            balance_after = wallet.free_credits + wallet.paid_credits
+            db.add(UserCreditLog(
+                user_id=user_id, amount=-amount, credit_type=credit_type,
+                action_type=ActionType.ADMIN_DEDUCT, balance_after=balance_after,
+                operator_user_id=operator_user_id, reason=reason,
+            ))
+            # Snapshot before releasing the lock, so the response matches this operation.
+            response = {
+                "user_id": user_id, "username": user.username, "email": user.email,
+                "deducted_points": amount, "credit_type": credit_type,
+                "free_credits": wallet.free_credits, "paid_credits": wallet.paid_credits,
+                "balance_after": balance_after,
+            }
+            await db.commit()
+            return response
+        except Exception:
+            await db.rollback()
+            raise
+
     async def _get_wallet_for_update(self, db: AsyncSession, user_id: int):
         stmt = select(UserCredit).where(UserCredit.user_id == user_id).with_for_update()
         result = await db.execute(stmt)

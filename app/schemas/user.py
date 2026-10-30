@@ -36,6 +36,7 @@ class UserCreditLogSerializer(BaseModel):
             "USE_PRO_MODEL": "Pro模型提问",
             "USE_VISION_DIFF": "拍照纠错",
             "TOP_UP": "点数充值",
+            "ADMIN_DEDUCT": "管理员扣减",
         }
         val_str = v.value if hasattr(v, "value") else str(v)
         return mapping.get(val_str, val_str)

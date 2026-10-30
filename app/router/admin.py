@@ -22,9 +22,12 @@ from app.schemas.admin import (
     AdminWalletRechargeRequest,
     AdminWalletRechargeResponse,
     AdminWalletSummary,
+    AdminWalletDeductRequest,
+    AdminWalletDeductResponse,
 )
 from app.schemas.response import APIResponse
 from app.services.admin import admin_service
+from app.services.wallet_service import wallet_service
 from app.services.fxcm_market_sync import (
     fxcm_market_sync_scheduler,
     fxcm_market_sync_service,
@@ -154,6 +157,26 @@ async def recharge_admin_wallet(
         amount=payload.amount,
     )
     return APIResponse(message="钱包充值成功", data=data)
+
+
+@router.post(
+    "/wallets/{user_id}/deduct",
+    response_model=APIResponse[AdminWalletDeductResponse],
+    summary="人工扣减用户算力",
+    description="按指定算力类型扣减，余额不足时拒绝；记录操作人和原因。",
+)
+async def deduct_admin_wallet(
+    user_id: int,
+    payload: AdminWalletDeductRequest,
+    current_user: User = Depends(verify_superuser),
+    db: AsyncSession = Depends(get_db),
+):
+    data = await wallet_service.deduct_admin_credit(
+        db=db, user_id=user_id, amount=payload.amount,
+        credit_type=payload.credit_type, reason=payload.reason,
+        operator_user_id=current_user.id,
+    )
+    return APIResponse(message="算力扣减成功", data=data)
 
 
 @router.get(

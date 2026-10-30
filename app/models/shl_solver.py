@@ -35,3 +35,4 @@ class ActionType(str, enum.Enum):
     USE_PRO_MODEL = "USE_PRO_MODEL"
     USE_VISION_DIFF = "USE_VISION_DIFF"
     TOP_UP = "TOP_UP"
+    ADMIN_DEDUCT = "ADMIN_DEDUCT"

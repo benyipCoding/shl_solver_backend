@@ -93,6 +93,28 @@ class AdminWalletRechargeResponse(BaseModel):
     balance_after: int
 
 
+class AdminWalletDeductRequest(BaseModel):
+    amount: int = Field(..., strict=True, gt=0, le=2147483647)
+    credit_type: CreditType
+    reason: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminWalletDeductResponse(BaseModel):
+    user_id: int
+    username: str
+    email: EmailStr
+    deducted_points: int
+    credit_type: CreditType
+    free_credits: int
+    paid_credits: int
+    balance_after: int
+
+
 class AdminCreditLogItem(BaseModel):
     id: int
     user_id: int
@@ -102,6 +124,8 @@ class AdminCreditLogItem(BaseModel):
     credit_type: CreditType
     action_type: ActionType
     balance_after: int
+    operator_user_id: Optional[int] = None
+    reason: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

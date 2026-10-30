@@ -394,6 +394,8 @@ class AdminService:
                     "credit_type": record.credit_type,
                     "action_type": record.action_type,
                     "balance_after": record.balance_after,
+                    "operator_user_id": record.operator_user_id,
+                    "reason": record.reason,
                     "created_at": record.created_at,
                     "updated_at": record.updated_at,
                 }
@@ -426,6 +428,8 @@ class AdminService:
             "credit_type": record.credit_type,
             "action_type": record.action_type,
             "balance_after": record.balance_after,
+            "operator_user_id": record.operator_user_id,
+            "reason": record.reason,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
         }
