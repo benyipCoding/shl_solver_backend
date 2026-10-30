@@ -7,11 +7,14 @@ from app.prompts.shl_analyze import (
 from app.utils.helpers import base64_to_bytes
 from app.schemas.shl_analyze import (
     SHLAnalyzePayload,
+    SHLAnalyzeResult,
     SHLCodeVerifyPayload,
     SHLCodeVerifyResult,
 )
 from google.genai import types
 from app.clients.gemini import get_gemini_client
+from app.clients.openai import get_openai_client
+from app.core.shl_models import DEFAULT_SHL_MODEL, get_shl_model_config
 
 from app.clients.openrouter import get_openrouter_client
 import json
@@ -30,6 +33,9 @@ class SHLAnalyzeService:
         images_data expected format:
         [{"mimeType": "image/jpeg", "data": "<base64_encoded_string>"}, ...]
         """
+        if get_shl_model_config(llm_key).provider == "openai":
+            return await self.analyze_openai(payload, llm_key)
+
         try:
             current_user_prompt = user_prompt
 
@@ -128,7 +134,7 @@ class SHLAnalyzeService:
             user_parts = [instruction_part, reference_code_part]
 
             # Process Images
-            images_to_process = payload.images_data or []
+            images_to_process = list(payload.images_data or [])
             if getattr(payload, "image_data", None):
                 images_to_process.append(payload.image_data)
 
@@ -146,7 +152,7 @@ class SHLAnalyzeService:
             contents = [types.Content(role="user", parts=user_parts)]
 
             client = get_gemini_client()
-            model_name = "gemini-3-flash-preview"
+            model_name = DEFAULT_SHL_MODEL
 
             response = await client.aio.models.generate_content(
                 model=model_name,
@@ -189,6 +195,14 @@ class SHLAnalyzeService:
             print(f"Error during code verification: {str(e)}")
             raise e
 
+    async def analyze_openai(
+        self,
+        payload: SHLAnalyzePayload,
+        llm_key: str,
+    ):
+        """Analyze screenshots through the configured OpenAI-compatible gateway."""
+        return await self._analyze_chat_completion(payload, llm_key, get_openai_client())
+
     async def analyze_openrouter(
         self,
         request: Request,
@@ -196,6 +210,9 @@ class SHLAnalyzeService:
         db: AsyncSession,
         llm_key: str,
     ):
+        return await self._analyze_chat_completion(payload, llm_key, get_openrouter_client())
+
+    async def _analyze_chat_completion(self, payload, llm_key, client):
         try:
             current_user_prompt = user_prompt
 
@@ -220,8 +237,7 @@ class SHLAnalyzeService:
                 base64_data = getattr(img, "data", "")
 
                 if base64_data:
-                    # Constructor for base64 OpenRouter URL
-                    image_url = f"data:{mime_type};base64,{base64_data}"
+                    image_url = base64_data if base64_data.startswith("data:") else f"data:{mime_type};base64,{base64_data}"
                     user_content.append(
                         {"type": "image_url", "image_url": {"url": image_url}}
                     )
@@ -238,15 +254,13 @@ class SHLAnalyzeService:
                 )
                 tc_base64_data = getattr(payload.test_case_image, "data", "")
                 if tc_base64_data:
-                    image_url = f"data:{tc_mime_type};base64,{tc_base64_data}"
+                    image_url = tc_base64_data if tc_base64_data.startswith("data:") else f"data:{tc_mime_type};base64,{tc_base64_data}"
                     user_content.append(
                         {"type": "image_url", "image_url": {"url": image_url}}
                     )
 
             if user_content:
                 messages.append({"role": "user", "content": user_content})
-
-            client = get_openrouter_client()
 
             response = await client.chat.completions.create(
                 model=llm_key,
@@ -256,21 +270,24 @@ class SHLAnalyzeService:
 
             total_token_count = response.usage.total_tokens if response.usage else 0
 
-            raw_text = (
-                response.choices[0].message.content.strip()
-                if response.choices and response.choices[0].message.content
-                else "{}"
-            )
+            if not response.choices or not response.choices[0].message.content:
+                raise ValueError("Empty response from LLM")
+            raw_text = response.choices[0].message.content.strip()
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:]
             if raw_text.endswith("```"):
                 raw_text = raw_text[:-3]
 
-            result = json.loads(raw_text.strip())
+            raw_text = re.sub(r'(?<!\\)\\([^"\\/bfnrtu])', r"\\\\\1", raw_text.strip())
+            result = json.loads(raw_text)
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            # Invalid output must fail the task so the existing refund path runs.
+            result = SHLAnalyzeResult.model_validate(result).model_dump()
             return result, total_token_count
 
         except Exception as e:
-            print(f"Error during SHL analysis with OpenRouter: {str(e)}")
+            print(f"Error during SHL analysis with Chat Completions: {str(e)}")
             raise e
 
     async def verify_code_openrouter(

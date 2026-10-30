@@ -17,7 +17,8 @@ class ExcelWorkbenchService:
             llm_key = "gemini-3-flash-preview"  # 目前先写死，后续可以从 payload 里传入，支持用户选择不同的模型
             client = get_gemini_client()
             system_instruction = generate_prompt(
-                columns=payload.columns, sampleRow=payload.sample_row
+                columns=payload.columns, sampleRow=payload.sample_row,
+                protocol_version=payload.protocol_version,
             )
 
             response = await client.aio.models.generate_content(
@@ -40,7 +41,7 @@ class ExcelWorkbenchService:
                 return response.parsed.model_dump()
             else:
                 # 退回使用 text 手动解析
-                return json.loads(response.text)
+                return AIResponseSchema.model_validate_json(response.text).model_dump()
         except Exception as e:
             # 实际生产中建议记录日志
             raise HTTPException(

@@ -29,16 +29,12 @@ from app.services.task_worker import (
 from sqlalchemy.future import select
 import traceback
 from app.clients.posthog_client import capture_event
+from app.core.shl_models import get_shl_model_config, VERIFY_CODE_COST
 
 
 router = APIRouter(
     prefix="/shl_analyze", tags=["SHL Analyze"], dependencies=[Depends(verify_user)]
 )
-
-GEMINI_PRO_COST = 30
-GEMINI_FLASH_COST = 10
-VERIFY_CODE_COST = 5
-
 
 @router.post(
     "",
@@ -57,15 +53,18 @@ async def process_shl_analyze(
     if not llm or not llm.enabled:
         return APIResponse(message="LLM not found or disabled", code=404)
 
+    try:
+        model_config = get_shl_model_config(llm.key)
+    except ValueError:
+        return APIResponse(message="Unsupported SHL model", code=400)
+
     user_id = request.state.user.id
     client_ip = getattr(request.state, "real_ip", request.client.host)
     req_path = request.url.path
 
     # ================= 1. 动态计费与流水类型判断 =================
-    # 根据 llm.key 判定是 Pro 还是 Flash，决定扣费金额和记录类型
-    is_pro = "pro" in llm.key.lower()
-    cost = GEMINI_PRO_COST if is_pro else GEMINI_FLASH_COST
-    action_type = ActionType.USE_PRO_MODEL if is_pro else ActionType.USE_FLASH_MODEL
+    cost = model_config.credits
+    action_type = model_config.action_type
 
     # ================= 2. 事前扣费 =================
     try:
@@ -105,7 +104,8 @@ async def process_shl_analyze(
                 "task_type": "SHL_ANALYZE",
                 "llm_key": llm.key,
                 "cost": cost,
-                "is_pro": is_pro,
+                "provider": model_config.provider,
+                "is_pro": action_type == ActionType.USE_PRO_MODEL,
                 "$ip": client_ip,
                 "$user_agent": request.headers.get("user-agent", ""),
             },

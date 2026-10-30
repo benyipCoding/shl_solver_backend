@@ -18,7 +18,7 @@ class SHLAnalyzeResult(BaseModel):
     key_concepts: list[str]
     constraints: list[str]
     solutions: dict[str, str]
-    complexity: dict[str, str]
+    complexity: dict[str, str] | str
 
 
 class SHLCodeVerifyPayload(BaseModel):

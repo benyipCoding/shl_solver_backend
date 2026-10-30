@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.clients.gemini import init_gemini_client
+from app.clients.openai import init_openai_client, close_openai_client
 from app.clients.ff14 import close_ff14_client, init_ff14_client
 from app.clients.ff14_v2 import close_ff14_v2_client, init_ff14_v2_client
 from app.core.config import settings
@@ -16,6 +17,8 @@ async def lifespan(app: FastAPI):
     # ===== startup =====
     init_gemini_client()
     print("✅ Gemini client initialized")
+    init_openai_client()
+    print("✅ OpenAI client initialized")
     init_openrouter_client()
     print("✅ OpenRouter client initialized")
     init_ff14_client()
@@ -45,6 +48,7 @@ async def lifespan(app: FastAPI):
             pass
 
     # ===== shutdown =====
+    await close_openai_client()
     # 关闭数据库连接
     try:
         await close_db()

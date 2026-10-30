@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     or_api_key: str
     gemini_api_key: str
     gemini_base_url: str
+    openai_base_url: str
 
     # async: FastAPI / SQLAlchemy AsyncSession 使用
     database_url_async: str
@@ -66,7 +67,9 @@ class Settings(BaseSettings):
     def can_use_fxcm_realtime(self) -> bool:
         # Explicit allow-list: never infer realtime access from hostnames.
         return self.fxcm_realtime_enabled and self.app_env.strip().casefold() in {
-            "local", "dev", "development"
+            "local",
+            "dev",
+            "development",
         }
 
     # FXCM market data sync MVP

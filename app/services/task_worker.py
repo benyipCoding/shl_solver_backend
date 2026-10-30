@@ -15,6 +15,7 @@ from app.utils.file_handler import (
 )
 from app.utils.alert_utils import send_email_alert
 from app.clients.posthog_client import capture_event
+from app.core.shl_models import DEFAULT_SHL_MODEL
 
 
 async def background_shl_solver_task(
@@ -159,7 +160,7 @@ async def background_code_verify_task(
     """
     async with db_client.async_session() as db:
         assert isinstance(db, AsyncSession), "async_session 必须返回 AsyncSession 实例"
-        llm_key = "gemini-3-flash-preview"  # 内部使用
+        llm_key = DEFAULT_SHL_MODEL
         try:
             stmt = select(AITask).where(AITask.task_id == task_id)
             result = await db.execute(stmt)
