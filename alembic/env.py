@@ -5,6 +5,7 @@ from sqlalchemy import pool
 
 from alembic import context
 from app.models.base import Base
+from app.models.homepage import HomepageConfig
 from app.models.user import User
 from app.models.llms import LLMs
 from app.models.token_record import TokenRecord

@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, Request
 from app.core.lifespan import lifespan
 from app.core.config import settings
 from app.router import (
+    homepage,
     admin,
     auth,
     captcha,
@@ -59,6 +60,7 @@ app.add_middleware(UserAuthMiddleware)
 
 # 创建一个总的 API 路由，并设置前缀
 api_router = APIRouter()
+api_router.include_router(homepage.router)
 api_router.include_router(auth.router)
 api_router.include_router(captcha.router)
 api_router.include_router(admin.router)
