@@ -37,15 +37,6 @@ async def capabilities():
     return {"enabled": settings.can_use_fxcm_realtime}
 
 
-def normalize_event(event, interval):
-    # Historical endpoints expose date-only strings for D/W/M candles. Use
-    # their same display identity, keeping the provider timestamp for debugging.
-    if interval in {"1day", "1week", "1month"}:
-        for candle in event.get("candles", []):
-            candle["datetime"] = candle["datetime"][:10]
-    return event
-
-
 @router.get("/history")
 async def history(
     symbol: str = Query(..., min_length=1, max_length=64),
@@ -100,11 +91,6 @@ async def history(
     meta = payload.get("meta") if isinstance(payload, dict) else {}
     if not isinstance(meta, dict):
         meta = {}
-    if interval in {"1day", "1week", "1month"}:
-        for candle in values:
-            datetime_value = candle.get("datetime")
-            if isinstance(datetime_value, str):
-                candle["datetime"] = datetime_value[:10]
 
     earliest = values[0].get("datetime") if values else None
     latest = values[-1].get("datetime") if values else None
@@ -186,7 +172,7 @@ async def stream(symbol: str = Query(..., min_length=1, max_length=64), interval
                         return
                     async for line in response.aiter_lines():
                         if line.startswith("data: "):
-                            event = normalize_event(json.loads(line[6:]), interval)
+                            event = json.loads(line[6:])
                             yield "data: " + json.dumps(event, allow_nan=False) + "\n\n"
                         elif line.startswith(":"):
                             yield line + "\n\n"

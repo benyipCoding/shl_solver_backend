@@ -9,8 +9,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 
 from app.models.market_data import MarketInstrument, MarketInstrumentAlias, MarketOHLCVBar
 from app.services.market_data_replica import MarketDataReplicaService
@@ -109,3 +110,65 @@ class ReplicaIncrementalTest(unittest.TestCase):
         # "1h" 排在 "5min" 前面，已推送并提交，不会随后一个序列的失败回滚。
         self.assertEqual(self.target_hours("1h"), list(range(10)))
         self.assertEqual(self.target_hours("5min"), [])
+
+    def disconnect_before_statement(self, should_disconnect):
+        # 只终止隔离测试库中本用例正在使用的目标连接。
+        def listener(conn, cursor, statement, parameters, context, executemany):
+            if should_disconnect(statement):
+                pid = conn.connection.driver_connection.info.backend_pid
+                with self.admin.connect() as admin:
+                    self.assertTrue(admin.scalar(
+                        text("SELECT pg_terminate_backend(:pid, 5000)"), {"pid": pid},
+                    ))
+
+        engine = self.service._target_engine
+        event.listen(engine, "before_cursor_execute", listener)
+        self.addCleanup(event.remove, engine, "before_cursor_execute", listener)
+
+    def test_reconnects_after_watermark_query_disconnect(self):
+        with self.service._source_session() as source:
+            source.add(self.bar(1, "15min", 0))
+            source.commit()
+
+        def disconnect_first_watermark(statement):
+            if "min(market_ohlcv_bar.bar_time)" in statement:
+                watermarks.append(statement)
+                return len(watermarks) == 1
+            return False
+
+        watermarks = []
+        self.disconnect_before_statement(disconnect_first_watermark)
+        self.assertEqual(self.service.sync_bars_incremental(), 1)
+        self.assertEqual(len(watermarks), 2)
+        self.assertEqual(self.target_hours("15min"), [0])
+
+    def test_replays_whole_series_after_disconnect_on_second_page(self):
+        with self.service._source_session() as source:
+            source.add_all([self.bar(1, "1h", h) for h in range(105)])
+            source.commit()
+
+        writes = 0
+
+        def disconnect_second_write(statement):
+            nonlocal writes
+            if statement.startswith("INSERT INTO market_ohlcv_bar"):
+                writes += 1
+                return writes == 2
+            return False
+
+        self.disconnect_before_statement(disconnect_second_write)
+        self.assertEqual(self.service.sync_bars_incremental(), 105)
+        self.assertEqual(writes, 4)
+        self.assertEqual(self.target_hours("1h"), list(range(105)))
+
+    def test_persistent_disconnect_is_reported(self):
+        with self.service._source_session() as source:
+            source.add(self.bar(1, "1h", 0))
+            source.commit()
+        self.disconnect_before_statement(lambda stmt: "min(market_ohlcv_bar.bar_time)" in stmt)
+        with patch("app.services.market_data_replica.service.time.sleep") as backoff:
+            with self.assertRaises(DBAPIError) as raised:
+                self.service.sync_bars_incremental()
+        self.assertTrue(raised.exception.connection_invalidated)
+        self.assertEqual(backoff.call_count, 2)
+        self.assertEqual(self.target_hours("1h"), [])

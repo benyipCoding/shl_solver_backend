@@ -1205,12 +1205,10 @@ class MarketMasterService:
         if order != "asc":
             rows = list(reversed(rows))
 
-        intraday = self._is_intraday_interval(requested_interval)
         values = [
             self._format_time_series_row(
                 row,
                 timezone_name=response_timezone,
-                intraday=intraday,
                 dp=dp,
             )
             for row in rows
@@ -1353,7 +1351,6 @@ class MarketMasterService:
         row: Mapping[str, Any],
         *,
         timezone_name: str | None,
-        intraday: bool,
         dp: int | None,
     ) -> dict[str, Any]:
         timestamp = self._to_int(row.get("timestamp")) or 0
@@ -1361,7 +1358,6 @@ class MarketMasterService:
             "datetime": self._format_output_datetime(
                 timestamp,
                 timezone_name=timezone_name,
-                intraday=intraday,
             ),
             "open": self._round_number(self._to_float(row.get("open")), dp),
             "high": self._round_number(self._to_float(row.get("high")), dp),
@@ -1379,7 +1375,6 @@ class MarketMasterService:
         timestamp: int,
         *,
         timezone_name: str | None,
-        intraday: bool,
     ) -> str:
         output_datetime = datetime.fromtimestamp(timestamp, tz=timezone.utc)
         if timezone_name is not None:
@@ -1388,10 +1383,8 @@ class MarketMasterService:
             except ZoneInfoNotFoundError:
                 pass
 
-        if intraday:
-            return output_datetime.replace(tzinfo=None).isoformat(timespec="seconds")
-
-        return output_datetime.date().isoformat()
+        # Calendar bars also have a session open, which need not be midnight.
+        return output_datetime.replace(tzinfo=None).isoformat(timespec="seconds")
 
     def _resolve_output_timezone_name(
         self,

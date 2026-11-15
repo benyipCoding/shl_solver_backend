@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import create_engine, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models.market_data import (
@@ -28,6 +30,8 @@ from app.services.market_master import market_master_service
 
 
 logger = logging.getLogger(__name__)
+
+_SERIES_SYNC_ATTEMPTS = 3
 
 _REPLICA_TABLES = (
     "market_instrument",
@@ -114,7 +118,7 @@ class MarketDataReplicaService:
         overlap_bars: int = 2,
     ) -> None:
         self._source_engine = create_engine(source_database_url, future=True)
-        self._target_engine = create_engine(target_database_url, future=True)
+        self._target_engine = create_engine(target_database_url, future=True, pool_pre_ping=True)
         self._source_session_factory = sessionmaker(
             bind=self._source_engine, expire_on_commit=False
         )
@@ -333,10 +337,10 @@ class MarketDataReplicaService:
         每个序列推完即提交，避免大批量补数时出现超长事务，中途失败也不丢已推送的序列。
         """
         total = 0
-        with self._source_session() as source, self._target_session() as target:
-            id_map = self._build_instrument_id_map(source, target)
+        with self._source_session() as source:
+            with self._target_session() as target:
+                id_map = self._build_instrument_id_map(source, target)
             if not id_map:
-                target.commit()
                 return 0
 
             groups = source.execute(
@@ -354,53 +358,67 @@ class MarketDataReplicaService:
                 )
             ).all()
 
-            for source_instrument_id, interval, price_type in groups:
-                target_instrument_id = id_map.get(int(source_instrument_id))
-                if target_instrument_id is None:
-                    continue
+        for source_instrument_id, interval, price_type in groups:
+            target_instrument_id = id_map.get(int(source_instrument_id))
+            if target_instrument_id is None:
+                continue
 
-                remote_min_bar_time, remote_max_bar_time = target.execute(
-                    select(
-                        func.min(MarketOHLCVBar.bar_time),
-                        func.max(MarketOHLCVBar.bar_time),
-                    ).where(
-                        MarketOHLCVBar.instrument_id == target_instrument_id,
-                        MarketOHLCVBar.interval == interval,
-                        MarketOHLCVBar.price_type == price_type,
+            for attempt in range(1, _SERIES_SYNC_ATTEMPTS + 1):
+                try:
+                    with self._source_session() as source, self._target_session() as target:
+                        count = self._sync_bar_series(
+                            source, target, source_instrument_id, target_instrument_id,
+                            interval, price_type,
+                        )
+                        target.commit()
+                except DBAPIError as exc:
+                    if not exc.connection_invalidated or attempt == _SERIES_SYNC_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        "Database disconnected syncing instrument_id=%s interval=%s price_type=%s; "
+                        "retrying series (attempt %s/%s)",
+                        target_instrument_id, interval, price_type, attempt + 1, _SERIES_SYNC_ATTEMPTS,
                     )
-                ).one()
-
-                stmt = (
-                    select(MarketOHLCVBar)
-                    .where(
-                        MarketOHLCVBar.instrument_id == source_instrument_id,
-                        MarketOHLCVBar.interval == interval,
-                        MarketOHLCVBar.price_type == price_type,
-                    )
-                    .order_by(MarketOHLCVBar.bar_time.asc())
-                )
-                if remote_max_bar_time is None:
-                    total += self._push_bar_pages(source, target, stmt, target_instrument_id)
+                    time.sleep(2 ** (attempt - 1))
                 else:
-                    overlap = interval_delta(interval) * max(1, self._overlap_bars)
-                    total += self._push_bar_pages(
-                        source,
-                        target,
-                        stmt.where(
-                            MarketOHLCVBar.bar_time >= remote_max_bar_time - overlap
-                        ),
-                        target_instrument_id,
-                    )
-                    total += self._push_bar_pages(
-                        source,
-                        target,
-                        stmt.where(MarketOHLCVBar.bar_time < remote_min_bar_time),
-                        target_instrument_id,
-                    )
-                target.commit()
-
-            target.commit()
+                    total += count
+                    break
         return total
+
+    def _sync_bar_series(
+        self, source: Session, target: Session, source_instrument_id: int,
+        target_instrument_id: int, interval: str, price_type: str,
+    ) -> int:
+        remote_min_bar_time, remote_max_bar_time = target.execute(
+            select(func.min(MarketOHLCVBar.bar_time), func.max(MarketOHLCVBar.bar_time))
+            .where(
+                MarketOHLCVBar.instrument_id == target_instrument_id,
+                MarketOHLCVBar.interval == interval,
+                MarketOHLCVBar.price_type == price_type,
+            )
+        ).one()
+        stmt = (
+            select(MarketOHLCVBar)
+            .where(
+                MarketOHLCVBar.instrument_id == source_instrument_id,
+                MarketOHLCVBar.interval == interval,
+                MarketOHLCVBar.price_type == price_type,
+            )
+            .order_by(MarketOHLCVBar.bar_time.asc())
+        )
+        if remote_max_bar_time is None:
+            return self._push_bar_pages(source, target, stmt, target_instrument_id)
+
+        overlap = interval_delta(interval) * max(1, self._overlap_bars)
+        newer = self._push_bar_pages(
+            source, target, stmt.where(MarketOHLCVBar.bar_time >= remote_max_bar_time - overlap),
+            target_instrument_id,
+        )
+        older = self._push_bar_pages(
+            source, target, stmt.where(MarketOHLCVBar.bar_time < remote_min_bar_time),
+            target_instrument_id,
+        )
+        return newer + older
 
     def _push_bar_pages(
         self,

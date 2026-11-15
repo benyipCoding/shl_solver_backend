@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
-from app.router.market_realtime import normalize_event, router
+from app.router.market_realtime import router
 
 
 class RealtimeGatewayTest(unittest.TestCase):
@@ -18,6 +18,21 @@ class RealtimeGatewayTest(unittest.TestCase):
         app = FastAPI()
         app.include_router(router)
         self.client = TestClient(app)
+
+    def test_calendar_bars_keep_the_session_open_in_both_historical_chart_responses(self):
+        from app.router.market_master import market_master_service as service
+
+        for interval in ("1day", "1week", "1month"):
+            with self.subTest(interval=interval):
+                raw = {"values": [{"timestamp": 1791838800, "open": 10, "close": 12}]}
+                series = service._build_time_series_payload_from_fxcm(
+                    raw, {"symbol": "EUR/USD", "interval": interval, "timezone": "UTC"}
+                )
+                defaults = service._normalize_kline(
+                    series, requested_symbol="EUR/USD", requested_interval=interval, defaults_applied={}
+                )
+                for row in (series["values"][0], defaults["candles"][0]):
+                    self.assertEqual(row["datetime"], "2026-10-12T21:00:00")
 
     def test_production_gate_does_not_contact_sidecar(self):
         for environment in ("prod", "production", "staging", "unknown"):
@@ -34,17 +49,6 @@ class RealtimeGatewayTest(unittest.TestCase):
             self.assertTrue(self.client.get("/market_master/realtime/capabilities").json()["enabled"])
             self.assertEqual(self.client.get("/market_master/realtime/stream?symbol=EUR/USD&interval=2seconds").status_code, 400)
 
-    def test_native_periods_use_same_date_identity_as_historical_frontend(self):
-        for interval in ("1day", "1week", "1month"):
-            event = {"type": "candles", "candles": [{"datetime": "2026-10-12T21:00:00+00:00", "timestamp": 1791838800}]}
-            result = normalize_event(event, interval)
-            self.assertEqual(result["candles"][0]["datetime"], "2026-10-12")
-            self.assertEqual(result["candles"][0]["timestamp"], 1791838800)
-
-    def test_intraday_timestamp_is_preserved(self):
-        event = {"type": "candles", "candles": [{"datetime": "2026-10-12T21:00:00+00:00"}]}
-        self.assertEqual(normalize_event(event, "4h"), event)
-
     def test_stream_forwards_snapshot_and_uses_provider_symbol_without_database(self):
         event = {"type": "snapshot", "candles": [{"datetime": "2026-10-12T21:00:00+00:00"}]}
         requests = []
@@ -60,23 +64,23 @@ class RealtimeGatewayTest(unittest.TestCase):
             response = self.client.get("/market_master/realtime/stream?symbol=GOLD&interval=1day")
         self.assertIn("text/event-stream", response.headers["content-type"])
         data = json.loads(next(line[6:] for line in response.text.splitlines() if line.startswith("data: ")))
-        self.assertEqual(data["candles"][0]["datetime"], "2026-10-12")
+        self.assertEqual(data, event)
         self.assertEqual(requests[0].url.params["symbol"], "XAU/USD")
         self.assertEqual(requests[0].url.params["snapshot_size"], "256")
 
     def test_history_window_forwards_to_fxcm_without_database(self):
         values = [
             {
-                "datetime": "2026-10-12",
-                "timestamp": 1791763200,
+                "datetime": "2026-10-12T21:00:00+00:00",
+                "timestamp": 1791838800,
                 "open": 4100,
                 "high": 4200,
                 "low": 4050,
                 "close": 4150,
             },
             {
-                "datetime": "2026-10-13",
-                "timestamp": 1791849600,
+                "datetime": "2026-10-13T21:00:00+00:00",
+                "timestamp": 1791925200,
                 "open": 4150,
                 "high": 4250,
                 "low": 4100,
@@ -118,6 +122,8 @@ class RealtimeGatewayTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()["data"]
         self.assertEqual(data["values"], values)
+        self.assertEqual(data["earliest"], values[0]["datetime"])
+        self.assertEqual(data["latest"], values[-1]["datetime"])
         self.assertTrue(data["has_more_history"])
         self.assertEqual(requests[0].url.params["symbol"], "XAU/USD")
         self.assertEqual(requests[0].url.params["interval"], "1day")
