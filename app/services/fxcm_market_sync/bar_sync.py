@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
@@ -139,7 +139,8 @@ class BarSyncHandler:
         state.last_status = "SUCCESS"
         state.retry_count = 0
         state.sync_mode = SYNC_MODE_COMPLETED if complete else SYNC_MODE_BACKFILL
-        state.next_sync_from = None if complete else utc_now() + timedelta(seconds=120)
+        # 未完成则下一轮立即继续；单步只需数秒，额外冷却会让长历史回补慢一个数量级。
+        state.next_sync_from = None if complete else utc_now()
         state.updated_at = utc_now()
         return inserted_count
 
@@ -181,12 +182,15 @@ class BarSyncHandler:
 
         inserted = await self.upsert_bars(db, b_rows)
         b_bar_times = [row["bar_time"] for row in b_rows]
+        previous_earliest = state.earliest_synced_bar_time
         state.earliest_synced_bar_time = min_datetime(
             state.earliest_synced_bar_time, min(b_bar_times)
         )
         if (
             state.earliest_synced_bar_time <= BACKFILL_EARLIEST_DATE
             or len(b_rows) < HISTORY_BATCH_SIZE * 0.05
+            # 没拿到比已有最早 K 线更早的数据：FXCM 已无更早历史，避免无冷却地空转。
+            or state.earliest_synced_bar_time >= previous_earliest
         ):
             state.backfill_completed = True
         return inserted

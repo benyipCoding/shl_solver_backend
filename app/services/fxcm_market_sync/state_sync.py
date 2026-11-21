@@ -3,14 +3,13 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.market_data import (
     MarketBarSyncState,
     MarketInstrument,
-    MarketOHLCVBar,
     MarketSyncQueueItem,
 )
 from app.services.fxcm_market_sync.bar_sync import bar_sync_handler
@@ -165,19 +164,7 @@ class StateSyncHandler:
         now = utc_now()
         if before_batch is not None:
             await before_batch(db, result)
-        bar_count_subquery = (
-            select(
-                MarketOHLCVBar.instrument_id.label("instrument_id"),
-                func.count().label("bar_count"),
-            )
-            .where(
-                MarketOHLCVBar.provider == PROVIDER,
-                MarketOHLCVBar.interval.in_(SUPPORTED_INTERVALS),
-            )
-            .group_by(MarketOHLCVBar.instrument_id)
-            .subquery()
-        )
-
+        # 不按 K 线存量排序：对整张 K 线表 GROUP BY 计数在千万行级别要数分钟，会拖慢每一轮调度。
         stmt = (
             select(MarketBarSyncState, MarketInstrument)
             .join(
@@ -188,10 +175,6 @@ class StateSyncHandler:
                 MarketSyncQueueItem,
                 MarketSyncQueueItem.instrument_id == MarketBarSyncState.instrument_id,
             )
-            .outerjoin(
-                bar_count_subquery,
-                bar_count_subquery.c.instrument_id == MarketBarSyncState.instrument_id,
-            )
             .where(
                 MarketBarSyncState.provider == PROVIDER,
                 MarketBarSyncState.interval.in_(SUPPORTED_INTERVALS),
@@ -200,7 +183,6 @@ class StateSyncHandler:
                 MarketInstrument.is_active.is_(True),
             )
             .order_by(
-                func.coalesce(bar_count_subquery.c.bar_count, 0).asc(),
                 MarketBarSyncState.last_attempt_at.asc().nullsfirst(),
                 MarketBarSyncState.priority.asc(),
             )

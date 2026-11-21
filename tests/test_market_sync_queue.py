@@ -189,6 +189,39 @@ class SyncHistoryStateTest(unittest.IsolatedAsyncioTestCase):
         handler = await self.run_state(state)
         handler._pull_forward_bars.assert_not_awaited()
 
+    async def test_incomplete_state_is_due_again_without_cooldown(self):
+        state = history_state(latest=CUTOFF, earliest=CUTOFF - timedelta(days=30), backfill_completed=False)
+        set_forward_cursor(state, CUTOFF)
+        await self.run_state(state)
+        self.assertEqual(state.sync_mode, "BACKFILL")
+        self.assertLessEqual(state.next_sync_from, utc_now())
+
+
+class BackfillStepTest(unittest.IsolatedAsyncioTestCase):
+    async def run_backfill(self, state, bar_times):
+        handler = BarSyncHandler()
+        handler.upsert_bars = AsyncMock(side_effect=lambda db, rows: len(rows))
+        values = [{"datetime": t.isoformat(), "close": 1} for t in bar_times]
+        with patch(
+            "app.services.fxcm_market_sync.bar_sync.fxcm_sidecar_service.get_history",
+            AsyncMock(return_value={"values": values, "meta": {}}),
+        ):
+            await handler._backfill_step(object(), state, MarketInstrument(id=1, provider_symbol="NAS100"))
+
+    async def test_older_batch_moves_earliest_back(self):
+        earliest = datetime(2009, 9, 8, tzinfo=timezone.utc)
+        state = history_state(interval="5min", earliest=earliest, backfill_completed=False)
+        await self.run_backfill(state, [earliest - timedelta(minutes=5 * i) for i in range(2000)])
+        self.assertEqual(state.earliest_synced_bar_time, earliest - timedelta(minutes=5 * 1999))
+        self.assertFalse(state.backfill_completed)
+
+    async def test_batch_without_older_bars_completes_backfill(self):
+        earliest = datetime(2009, 9, 8, tzinfo=timezone.utc)
+        state = history_state(interval="5min", earliest=earliest, backfill_completed=False)
+        await self.run_backfill(state, [earliest + timedelta(minutes=5 * i) for i in range(2000)])
+        self.assertEqual(state.earliest_synced_bar_time, earliest)
+        self.assertTrue(state.backfill_completed)
+
 
 @unittest.skipUnless(os.getenv("MARKET_SYNC_TEST_DATABASE_URL"), "isolated PostgreSQL URL required")
 class SyncQueuePostgresTest(unittest.IsolatedAsyncioTestCase):
