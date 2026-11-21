@@ -142,24 +142,56 @@ class ReplicaIncrementalTest(unittest.TestCase):
         self.assertEqual(len(watermarks), 2)
         self.assertEqual(self.target_hours("15min"), [0])
 
-    def test_replays_whole_series_after_disconnect_on_second_page(self):
+    def nth_bar_write_disconnects(self, n):
+        writes = []
+
+        def should_disconnect(statement):
+            if statement.startswith("INSERT INTO market_ohlcv_bar"):
+                writes.append(statement)
+                return len(writes) == n
+            return False
+
+        self.disconnect_before_statement(should_disconnect)
+        return writes
+
+    def test_resumes_from_committed_batch_after_disconnect_on_second_page(self):
         with self.service._source_session() as source:
             source.add_all([self.bar(1, "1h", h) for h in range(105)])
             source.commit()
 
-        writes = 0
-
-        def disconnect_second_write(statement):
-            nonlocal writes
-            if statement.startswith("INSERT INTO market_ohlcv_bar"):
-                writes += 1
-                return writes == 2
-            return False
-
-        self.disconnect_before_statement(disconnect_second_write)
-        self.assertEqual(self.service.sync_bars_incremental(), 105)
-        self.assertEqual(writes, 4)
+        writes = self.nth_bar_write_disconnects(2)
+        with patch("app.services.market_data_replica.service.time.sleep"):
+            # 第一批 100 根已提交；重连后只补推剩余部分（含 2 根重叠）。
+            self.assertEqual(self.service.sync_bars_incremental(), 108)
+        self.assertEqual(len(writes), 3)
         self.assertEqual(self.target_hours("1h"), list(range(105)))
+
+    def test_backfilled_history_resumes_without_gap_after_disconnect(self):
+        # 远程只有 250~260；本地回补到 0。回补按时间降序分批推，断连后从远程新的最早处续推。
+        with self.service._source_session() as source:
+            source.add_all([self.bar(1, "1h", h) for h in range(0, 261)])
+            source.commit()
+        with self.service._target_session() as target:
+            target.add_all([self.bar(99, "1h", h) for h in range(250, 261)])
+            target.commit()
+
+        writes = self.nth_bar_write_disconnects(3)
+        with patch("app.services.market_data_replica.service.time.sleep"):
+            self.service.sync_bars_incremental()
+        self.assertEqual(self.target_hours("1h"), list(range(0, 261)))
+
+    def test_logs_overall_progress_per_batch(self):
+        with self.service._source_session() as source:
+            source.add_all([self.bar(1, "1h", h) for h in range(250)])
+            source.commit()
+
+        with self.assertLogs("app.services.market_data_replica.service", level="INFO") as logs:
+            self.service.sync_bars_incremental()
+
+        progress = [line for line in logs.output if "rows | series" in line]
+        self.assertEqual(len(progress), 3)
+        self.assertIn("250/250 rows | series 1/1 XAU/USD 1h mid (full) 250/250", progress[-1])
+        self.assertIn("100.0%", progress[-1])
 
     def test_persistent_disconnect_is_reported(self):
         with self.service._source_session() as source:

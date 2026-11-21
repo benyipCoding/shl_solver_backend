@@ -8,7 +8,9 @@ Typical workflow (local machine with SSH tunnel to prod PG):
   python scripts/sync_market_to_prod.py bootstrap
 
   # 2) Scheduled incremental push (Task Scheduler every 5-15 min); pushes bars newer than
-  #    the remote latest and backfilled bars older than the remote earliest, committing per series
+  #    the remote latest and backfilled bars older than the remote earliest. Commits every
+  #    --batch-size rows and logs overall progress; after a dropped connection it reconnects
+  #    and resumes from the last committed batch.
   python scripts/sync_market_to_prod.py incremental
 
   # 3) Push all pending local repairs to prod (failed jobs retry next time)
