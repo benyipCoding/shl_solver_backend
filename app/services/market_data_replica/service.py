@@ -65,6 +65,37 @@ _LIST_BAR_SERIES_SQL = text(
     """
 )
 
+# 一次往返取回全部序列的远程水位；每个序列仍走唯一索引首尾探测。
+# 远程经 SSH 隧道单次往返约 0.6s，逐个序列查询时 400 个序列光规划就要十几分钟。
+_REMOTE_WATERMARKS_SQL = text(
+    """
+    SELECT
+        s.instrument_id,
+        s.interval,
+        s.price_type,
+        (
+            SELECT min(market_ohlcv_bar.bar_time) FROM market_ohlcv_bar
+            WHERE market_ohlcv_bar.instrument_id = s.instrument_id
+              AND market_ohlcv_bar.interval = s.interval
+              AND market_ohlcv_bar.price_type = s.price_type
+        ) AS min_bar_time,
+        (
+            SELECT max(market_ohlcv_bar.bar_time) FROM market_ohlcv_bar
+            WHERE market_ohlcv_bar.instrument_id = s.instrument_id
+              AND market_ohlcv_bar.interval = s.interval
+              AND market_ohlcv_bar.price_type = s.price_type
+        ) AS max_bar_time
+    FROM unnest(
+        CAST(:instrument_ids AS integer[]),
+        CAST(:intervals AS text[]),
+        CAST(:price_types AS text[])
+    ) AS s(instrument_id, interval, price_type)
+    """
+)
+
+# 规划阶段统计本地待推行数时，每处理多少个序列输出一次进度。
+_PLAN_LOG_EVERY = 50
+
 
 @dataclass
 class _BarSeries:
@@ -488,7 +519,8 @@ class MarketDataReplicaService:
 
     def _plan_bar_series(self) -> list[_BarSeries]:
         """列出本地全部序列，读取远程水位并统计每个序列待推送行数（用于整体进度）。"""
-        logger.info("Planning bar sync: listing local series and remote watermarks")
+        started_at = time.monotonic()
+        logger.info("Planning bar sync: listing local series")
 
         def build_id_map(_attempt: int) -> dict[int, int]:
             with self._source_session() as source, self._target_session() as target:
@@ -499,7 +531,6 @@ class MarketDataReplicaService:
             return []
 
         planned: list[_BarSeries] = []
-        unmapped = 0
         with self._source_session() as source:
             symbols = {
                 int(instrument_id): symbol
@@ -510,19 +541,35 @@ class MarketDataReplicaService:
                 ).all()
             }
             groups = source.execute(_LIST_BAR_SERIES_SQL, {"provider": PROVIDER}).all()
+            mapped = [
+                (int(source_instrument_id), id_map[int(source_instrument_id)], interval, price_type)
+                for source_instrument_id, interval, price_type in groups
+                if int(source_instrument_id) in id_map
+            ]
+            unmapped = len(groups) - len(mapped)
+            logger.info(
+                "Planning: %s local series (%s without a remote instrument); reading remote watermarks",
+                len(groups),
+                unmapped,
+            )
+            watermarks = self._retry_disconnects(
+                lambda _attempt: self._read_remote_watermarks_bulk(
+                    [(target_id, interval, price_type) for _, target_id, interval, price_type in mapped]
+                ),
+                describe="remote watermarks",
+            )
+            logger.info(
+                "Planning: remote watermarks read in %s; counting local rows to push",
+                _format_duration(time.monotonic() - started_at),
+            )
 
-            for source_instrument_id, interval, price_type in groups:
-                source_instrument_id = int(source_instrument_id)
-                target_instrument_id = id_map.get(source_instrument_id)
-                if target_instrument_id is None:
-                    unmapped += 1
-                    continue
-
-                remote_min, remote_max = self._retry_disconnects(
-                    lambda _attempt: self._read_remote_watermarks(
-                        target_instrument_id, interval, price_type
-                    ),
-                    describe=f"watermarks of instrument_id={target_instrument_id} {interval}",
+            for index, (source_instrument_id, target_instrument_id, interval, price_type) in enumerate(
+                mapped, start=1
+            ):
+                if index % _PLAN_LOG_EVERY == 0:
+                    logger.info("Planning: counted %s/%s series", index, len(mapped))
+                remote_min, remote_max = watermarks.get(
+                    (target_instrument_id, interval, price_type), (None, None)
                 )
                 pending = sum(
                     int(
@@ -554,12 +601,33 @@ class MarketDataReplicaService:
                 )
 
         logger.info(
-            "Planned %s of %s local series (%s without a remote instrument)",
+            "Planned %s of %s local series in %s (%s without a remote instrument)",
             len(planned),
             len(groups),
+            _format_duration(time.monotonic() - started_at),
             unmapped,
         )
         return planned
+
+    def _read_remote_watermarks_bulk(
+        self, series: Sequence[tuple[int, str, str]]
+    ) -> dict[tuple[int, str, str], tuple[datetime | None, datetime | None]]:
+        """一条查询读取多个序列的远程 (最早, 最新) bar_time。"""
+        if not series:
+            return {}
+        with self._target_session() as target:
+            rows = target.execute(
+                _REMOTE_WATERMARKS_SQL,
+                {
+                    "instrument_ids": [int(instrument_id) for instrument_id, _, _ in series],
+                    "intervals": [interval for _, interval, _ in series],
+                    "price_types": [price_type for _, _, price_type in series],
+                },
+            ).all()
+        return {
+            (int(instrument_id), interval, price_type): (min_bar_time, max_bar_time)
+            for instrument_id, interval, price_type, min_bar_time, max_bar_time in rows
+        }
 
     def _retry_disconnects(
         self,
